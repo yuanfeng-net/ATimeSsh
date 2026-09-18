@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900">
+  <rect width="1440" height="900" fill="#f5f1e8"/>
+  <rect x="0" y="0" width="1440" height="86" fill="#182333"/>
+  <text x="56" y="53" fill="#f7f2e8" font-family="Georgia, serif" font-size="31" font-weight="700">ATimeSsh</text>
+  <text x="245" y="49" fill="#cfd5db" font-family="Segoe UI, sans-serif" font-size="13" letter-spacing="2">SECURE ACCESS / LOCAL CONSOLE</text>
+  <circle cx="1260" cy="43" r="8" fill="#d66b4d"/><text x="1280" y="49" fill="#f7f2e8" font-family="Segoe UI, sans-serif" font-size="14">本机服务在线</text>
+  <rect x="0" y="86" width="322" height="814" fill="#ebe5da"/>
+  <text x="54" y="137" fill="#8f8678" font-family="Segoe UI, sans-serif" font-size="12" letter-spacing="1.5">SERVERS · 04</text>
+  <rect x="44" y="158" width="234" height="42" rx="8" fill="#f8f5ee" stroke="#cfc5b5"/>
+  <text x="64" y="185" fill="#8a8175" font-family="Segoe UI, sans-serif" font-size="14">⌕  搜索服务器</text>
+  <rect x="44" y="220" width="234" height="44" rx="8" fill="#d66b4d"/>
+  <text x="77" y="248" fill="#fffaf4" font-family="Segoe UI, sans-serif" font-size="14" font-weight="600">＋  添加服务器</text>
+  <text x="60" y="315" fill="#5d655f" font-family="Segoe UI, sans-serif" font-size="14" font-weight="700">生产环境</text>
+  <circle cx="60" cy="351" r="6" fill="#4f9d69"/><text x="80" y="357" fill="#182333" font-family="Segoe UI, sans-serif" font-size="15">东京 · API 节点</text><text x="80" y="377" fill="#8a8175" font-family="Segoe UI, sans-serif" font-size="12">203.0.113.12 · 22</text>
+  <circle cx="60" cy="421" r="6" fill="#4f9d69"/><text x="80" y="427" fill="#182333" font-family="Segoe UI, sans-serif" font-size="15">新加坡 · Worker</text><text x="80" y="447" fill="#8a8175" font-family="Segoe UI, sans-serif" font-size="12">203.0.113.28 · 22</text>
+  <text x="60" y="503" fill="#5d655f" font-family="Segoe UI, sans-serif" font-size="14" font-weight="700">测试环境</text>
+  <circle cx="60" cy="539" r="6" fill="#d6a33c"/><text x="80" y="545" fill="#182333" font-family="Segoe UI, sans-serif" font-size="15">Staging · Sandbox</text><text x="80" y="565" fill="#8a8175" font-family="Segoe UI, sans-serif" font-size="12">198.51.100.24 · 2222</text>
+  <circle cx="60" cy="609" r="6" fill="#c0b8aa"/><text x="80" y="615" fill="#182333" font-family="Segoe UI, sans-serif" font-size="15">本地开发机</text><text x="80" y="635" fill="#8a8175" font-family="Segoe UI, sans-serif" font-size="12">127.0.0.1 · 22</text>
+  <line x1="374" y1="142" x2="1385" y2="142" stroke="#d9d0c2"/>
+  <text x="380" y="190" fill="#182333" font-family="Georgia, serif" font-size="38" font-weight="700">东京 · API 节点</text>
+  <text x="382" y="219" fill="#8a8175" font-family="Segoe UI, sans-serif" font-size="14">生产环境 / 最近连接 2 分钟前</text>
+  <rect x="1147" y="173" width="238" height="49" rx="7" fill="#182333"/><text x="1181" y="204" fill="#f7f2e8" font-family="Segoe UI, sans-serif" font-size="14" font-weight="600">生成临时 SSH 链接  →</text>
+  <rect x="380" y="263" width="300" height="125" rx="10" fill="#eee7da"/><text x="405" y="299" fill="#8a8175" font-family="Segoe UI, sans-serif" font-size="12" letter-spacing="1">HOST</text><text x="405" y="337" fill="#182333" font-family="Georgia, serif" font-size="24">203.0.113.12</text><text x="405" y="366" fill="#5d655f" font-family="Segoe UI, sans-serif" font-size="13">SSH Port 22</text>
+  <rect x="704" y="263" width="300" height="125" rx="10" fill="#eee7da"/><text x="729" y="299" fill="#8a8175" font-family="Segoe UI, sans-serif" font-size="12" letter-spacing="1">STATUS</text><text x="729" y="337" fill="#3f8c5b" font-family="Georgia, serif" font-size="24">Operational</text><text x="729" y="366" fill="#5d655f" font-family="Segoe UI, sans-serif" font-size="13">Latency 42 ms</text>
+  <rect x="1028" y="263" width="357" height="125" rx="10" fill="#d66b4d"/><text x="1054" y="299" fill="#ffece2" font-family="Segoe UI, sans-serif" font-size="12" letter-spacing="1">ACCESS POLICY</text><text x="1054" y="337" fill="#fffaf4" font-family="Georgia, serif" font-size="24">Local-only</text><text x="1054" y="366" fill="#ffece2" font-family="Segoe UI, sans-serif" font-size="13">临时链接 10 分钟后失效</text>
+  <rect x="380" y="431" width="1005" height="315" rx="10" fill="#182333"/>
+  <text x="414" y="475" fill="#f7f2e8" font-family="Georgia, serif" font-size="22">临时 SSH 链接</text><circle cx="1318" cy="468" r="6" fill="#4f9d69"/><text x="1333" y="474" fill="#b8c5bd" font-family="Segoe UI, sans-serif" font-size="13">ACTIVE</text>
+  <rect x="414" y="503" width="770" height="62" rx="6" fill="#233044"/><text x="438" y="541" fill="#f6c7a4" font-family="Consolas, monospace" font-size="16">ssh relay@atimesh.local -p 51842 --token 7f4a...c92d</text>
+  <text x="414" y="604" fill="#9faeb9" font-family="Segoe UI, sans-serif" font-size="13">剩余有效时间</text><text x="414" y="651" fill="#fffaf4" font-family="Georgia, serif" font-size="37">08:42</text><text x="558" y="651" fill="#9faeb9" font-family="Segoe UI, sans-serif" font-size="14">将于 14:32 自动关闭</text>
+  <rect x="1074" y="610" width="96" height="39" rx="6" fill="#f7f2e8"/><text x="1095" y="635" fill="#182333" font-family="Segoe UI, sans-serif" font-size="13">复制链接</text>
+  <rect x="1182" y="610" width="96" height="39" rx="6" fill="#354a5d"/><text x="1203" y="635" fill="#f7f2e8" font-family="Segoe UI, sans-serif" font-size="13">续期</text>
+  <rect x="1290" y="610" width="72" height="39" rx="6" fill="#8f3e35"/><text x="1307" y="635" fill="#fffaf4" font-family="Segoe UI, sans-serif" font-size="13">关闭</text>
+  <text x="380" y="806" fill="#8a8175" font-family="Segoe UI, sans-serif" font-size="12">ATimeSsh / Secure access, without the ceremony.</text>
+</svg>

@@ -1,0 +1,19 @@
+# Rust build output
+native-host/target/
+
+# Frontend dependencies and generated bundles
+frontend/node_modules/
+frontend/dist/
+
+# Local runtime data and development state
+.test-appdata/
+.vectormind/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

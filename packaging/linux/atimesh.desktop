@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ATimeSsh
+Comment=Local-first SSH session manager
+Exec=atimesh-host
+Terminal=false
+Categories=Development;Network;
+StartupNotify=false
