@@ -20,7 +20,9 @@ use if_addrs::get_if_addrs;
 use rand::RngExt;
 use rusqlite::{params, Connection, OptionalExtension};
 use russh::server::{self, Auth, Msg, Server as RusshServer, Session};
-use russh::{client, Channel, ChannelId, Preferred, Pty};
+use russh::{
+    client, Channel, ChannelId, ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Preferred, Pty, Sig,
+};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 use serde::Serialize;
@@ -37,7 +39,7 @@ use std::{
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tokio::{
     net::{lookup_host, TcpListener, TcpSocket, TcpStream},
-    sync::oneshot,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
 };
 use tray_icon::{
@@ -1403,14 +1405,43 @@ impl RusshServer for RelayServer {
             token: self.token.clone(),
             target: self.target.clone(),
             preferred_interface: self.preferred_interface,
+            channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
+
+enum TargetRequest {
+    Pty {
+        term: String,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        modes: Vec<(Pty, u32)>,
+    },
+    Shell,
+    Exec(Vec<u8>),
+    Env {
+        name: String,
+        value: String,
+    },
+    Subsystem(String),
+    WindowChange {
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+    },
+    Signal(Sig),
+    Eof,
+    Close,
 }
 
 struct RelayHandler {
     token: String,
     target: ServerConfig,
     preferred_interface: Option<u32>,
+    channels: Arc<Mutex<HashMap<ChannelId, mpsc::Sender<TargetRequest>>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1452,27 +1483,19 @@ impl client::Handler for TargetClient {
 impl server::Handler for RelayHandler {
     type Error = russh::Error;
 
-    async fn pty_request(
-        &mut self,
-        channel: ChannelId,
-        _term: &str,
-        _col_width: u32,
-        _row_height: u32,
-        _pix_width: u32,
-        _pix_height: u32,
-        _modes: &[(Pty, u32)],
-        session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
-        Ok(())
-    }
-
     async fn shell_request(
         &mut self,
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
+        if self
+            .send_target_request(channel, TargetRequest::Shell)
+            .await
+        {
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
         Ok(())
     }
 
@@ -1514,35 +1537,270 @@ impl server::Handler for RelayHandler {
             .channel_open_session()
             .await
             .map_err(|_| russh::Error::Disconnect)?;
-        target_channel
-            .request_pty(false, "xterm", 120, 40, 0, 0, &[])
-            .await
-            .map_err(|_| russh::Error::Disconnect)?;
-        target_channel
-            .request_shell(true)
-            .await
-            .map_err(|_| russh::Error::Disconnect)?;
+        let channel_id = channel.id();
+        let (client_read, client_write) = channel.split();
+        let (target_read, target_write) = target_channel.split();
+        let (request_tx, request_rx) = mpsc::channel(32);
+        self.channels
+            .lock()
+            .map_err(|_| russh::Error::Disconnect)?
+            .insert(channel_id, request_tx);
         reply.accept().await;
-        let mut relay_stream = channel.into_stream();
-        let mut target_stream = target_channel.into_stream();
+        let channels = Arc::clone(&self.channels);
         tokio::spawn(async move {
-            let _ = tokio::io::copy_bidirectional(&mut relay_stream, &mut target_stream).await;
-            let _ = target_session
-                .disconnect(russh::Disconnect::ByApplication, "relay closed", "en")
-                .await;
+            relay_session(
+                client_read,
+                client_write,
+                target_read,
+                target_write,
+                request_rx,
+                target_session,
+            )
+            .await;
+            if let Ok(mut channels) = channels.lock() {
+                channels.remove(&channel_id);
+            }
         });
         Ok(())
     }
 
-    async fn data(
+    async fn channel_close(
         &mut self,
         channel: ChannelId,
-        data: &[u8],
-        session: &mut Session,
+        _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let _ = (channel, data, session);
+        let _ = self
+            .send_target_request(channel, TargetRequest::Close)
+            .await;
+        if let Ok(mut channels) = self.channels.lock() {
+            channels.remove(&channel);
+        }
         Ok(())
     }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let _ = self.send_target_request(channel, TargetRequest::Eof).await;
+        Ok(())
+    }
+
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        variable_name: &str,
+        variable_value: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.respond_to_target_request(
+            channel,
+            TargetRequest::Env {
+                name: variable_name.to_string(),
+                value: variable_value.to_string(),
+            },
+            session,
+        )
+        .await
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.respond_to_target_request(channel, TargetRequest::Subsystem(name.to_string()), session)
+            .await
+    }
+
+    async fn window_change_request(
+        &mut self,
+        channel: ChannelId,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.respond_to_target_request(
+            channel,
+            TargetRequest::WindowChange {
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+            },
+            session,
+        )
+        .await
+    }
+
+    async fn signal(
+        &mut self,
+        channel: ChannelId,
+        signal: Sig,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let _ = self
+            .send_target_request(channel, TargetRequest::Signal(signal))
+            .await;
+        Ok(())
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        command: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.respond_to_target_request(channel, TargetRequest::Exec(command.to_vec()), session)
+            .await
+    }
+
+    async fn pty_request(
+        &mut self,
+        channel: ChannelId,
+        term: &str,
+        col_width: u32,
+        row_height: u32,
+        pix_width: u32,
+        pix_height: u32,
+        modes: &[(Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.respond_to_target_request(
+            channel,
+            TargetRequest::Pty {
+                term: term.to_string(),
+                col_width,
+                row_height,
+                pix_width,
+                pix_height,
+                modes: modes.to_vec(),
+            },
+            session,
+        )
+        .await
+    }
+
+    async fn data(
+        &mut self,
+        _channel: ChannelId,
+        _data: &[u8],
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // Channel data is consumed by relay_session through ChannelReadHalf.
+        Ok(())
+    }
+}
+
+impl RelayHandler {
+    async fn respond_to_target_request(
+        &self,
+        channel: ChannelId,
+        request: TargetRequest,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        if self.send_target_request(channel, request).await {
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
+        Ok(())
+    }
+
+    async fn send_target_request(&self, channel: ChannelId, request: TargetRequest) -> bool {
+        let sender = self
+            .channels
+            .lock()
+            .ok()
+            .and_then(|channels| channels.get(&channel).cloned());
+        match sender {
+            Some(sender) => sender.send(request).await.is_ok(),
+            None => false,
+        }
+    }
+}
+
+async fn relay_session(
+    mut client_read: ChannelReadHalf,
+    client_write: ChannelWriteHalf<Msg>,
+    mut target_read: ChannelReadHalf,
+    target_write: ChannelWriteHalf<client::Msg>,
+    mut requests: mpsc::Receiver<TargetRequest>,
+    target_session: client::Handle<TargetClient>,
+) {
+    let mut client_open = true;
+    let mut target_open = true;
+
+    while client_open || target_open {
+        tokio::select! {
+            request = requests.recv(), if target_open => {
+                let Some(request) = request else { break };
+                let result = match request {
+                    TargetRequest::Pty { term, col_width, row_height, pix_width, pix_height, modes } => target_write.request_pty(true, &term, col_width, row_height, pix_width, pix_height, &modes).await,
+                    TargetRequest::Shell => target_write.request_shell(true).await,
+                    TargetRequest::Exec(command) => target_write.exec(true, command).await,
+                    TargetRequest::Env { name, value } => target_write.set_env(true, name, value).await,
+                    TargetRequest::Subsystem(name) => target_write.request_subsystem(true, name).await,
+                    TargetRequest::WindowChange { col_width, row_height, pix_width, pix_height } => target_write.window_change(col_width, row_height, pix_width, pix_height).await,
+                    TargetRequest::Signal(signal) => target_write.signal(signal).await,
+                    TargetRequest::Eof => target_write.eof().await,
+                    TargetRequest::Close => target_write.close().await,
+                };
+                if result.is_err() {
+                    break;
+                }
+            }
+            message = client_read.wait(), if client_open => {
+                match message {
+                    Some(ChannelMsg::Data { data }) => {
+                        if target_write.data_bytes(data).await.is_err() { break; }
+                    }
+                    Some(ChannelMsg::ExtendedData { data, ext }) => {
+                        if target_write.extended_data_bytes(ext, data).await.is_err() { break; }
+                    }
+                    Some(ChannelMsg::Eof) => {
+                        let _ = target_write.eof().await;
+                        client_open = false;
+                    }
+                    Some(ChannelMsg::Close) | None => {
+                        let _ = target_write.close().await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            message = target_read.wait(), if target_open => {
+                match message {
+                    Some(ChannelMsg::Data { data }) => {
+                        if client_write.data_bytes(data).await.is_err() { break; }
+                    }
+                    Some(ChannelMsg::ExtendedData { data, ext }) => {
+                        if client_write.extended_data_bytes(ext, data).await.is_err() { break; }
+                    }
+                    Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        let _ = client_write.exit_status(exit_status).await;
+                    }
+                    Some(ChannelMsg::Eof) => {
+                        let _ = client_write.eof().await;
+                        target_open = false;
+                    }
+                    Some(ChannelMsg::Close) | None => {
+                        let _ = client_write.close().await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let _ = target_session
+        .disconnect(russh::Disconnect::ByApplication, "relay closed", "en")
+        .await;
 }
 
 fn local_source_candidates(preferred_interface: Option<u32>) -> Vec<LocalSource> {
