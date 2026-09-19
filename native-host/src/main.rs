@@ -103,6 +103,27 @@ struct ServerSummary {
     host_key: Option<String>,
 }
 
+#[derive(Serialize)]
+struct ServerDetails {
+    id: String,
+    name: String,
+    host: String,
+    port: u16,
+    username: String,
+    environment: String,
+    host_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateServerRequest {
+    name: String,
+    host: String,
+    port: u16,
+    username: String,
+    #[serde(default)]
+    password: String,
+}
+
 #[derive(Deserialize)]
 struct AuthRequest {
     password: String,
@@ -214,10 +235,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .route(
                 "/api/servers/{server_id}/ssh-sessions",
-                post(create_session),
+                get(get_session).post(create_session),
             )
             .route("/api/servers", get(list_servers))
-            .route("/api/servers/{server_id}", post(upsert_server))
+            .route(
+                "/api/servers/{server_id}",
+                get(get_server).post(upsert_server).put(update_server),
+            )
             .route("/api/ssh-sessions/{session_id}", post(revoke_session))
             .route("/api/ssh-sessions/{session_id}/renew", post(renew_session))
             .route("/api/ssh-sessions/{session_id}/status", get(session_status))
@@ -861,6 +885,68 @@ async fn create_session(
     }))
 }
 
+async fn get_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(server_id): Path<String>,
+) -> Result<Json<SessionResponse>, (StatusCode, String)> {
+    if !authenticated(&state, &headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "authentication required".to_string(),
+        ));
+    }
+
+    let mut leases = state
+        .leases
+        .lock()
+        .map_err(|_| internal_error("lease lock poisoned"))?;
+    let session_id = leases
+        .iter()
+        .find(|(_, lease)| lease.server_id == server_id)
+        .map(|(id, _)| id.clone())
+        .ok_or((StatusCode::NOT_FOUND, "session not found".to_string()))?;
+
+    if leases
+        .get(&session_id)
+        .map(|lease| lease.expires_at <= SystemTime::now())
+        .unwrap_or(true)
+    {
+        if let Some(lease) = leases.remove(&session_id) {
+            lease.relay_task.abort();
+        }
+        if let Ok(db) = state.db.lock() {
+            let _ = db.execute("DELETE FROM ssh_sessions WHERE id = ?1", [&session_id]);
+        }
+        return Err((StatusCode::NOT_FOUND, "session not found".to_string()));
+    }
+
+    let lease = leases
+        .get(&session_id)
+        .ok_or((StatusCode::NOT_FOUND, "session not found".to_string()))?;
+    let username = state
+        .servers
+        .lock()
+        .map_err(|_| internal_error("server lock poisoned"))?
+        .get(&server_id)
+        .map(|server| server.username.clone())
+        .ok_or((StatusCode::NOT_FOUND, "server not found".to_string()))?;
+
+    Ok(Json(SessionResponse {
+        session_id,
+        server_id,
+        port: lease.port,
+        token: lease.token.clone(),
+        connect_command: format!(
+            "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{DEFAULT_HOST} -p {}",
+            username, lease.port
+        ),
+        connect_uri: format!("ssh://{}:{}@{DEFAULT_HOST}:{}", username, lease.token, lease.port),
+        expires_at: epoch_seconds(lease.expires_at),
+        max_expires_at: epoch_seconds(lease.max_expires_at),
+    }))
+}
+
 async fn upsert_server(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -936,6 +1022,117 @@ async fn upsert_server(
         .lock()
         .map_err(|_| internal_error("server lock poisoned"))?
         .insert(server_id, server);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(server_id): Path<String>,
+) -> Result<Json<ServerDetails>, (StatusCode, String)> {
+    if !authenticated(&state, &headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "authentication required".to_string(),
+        ));
+    }
+    let server = state
+        .servers
+        .lock()
+        .map_err(|_| internal_error("server lock poisoned"))?
+        .get(&server_id)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "server not found".to_string()))?;
+    Ok(Json(ServerDetails {
+        id: server_id,
+        name: server.name,
+        host: server.host,
+        port: server.port,
+        username: server.username,
+        environment: "STAGING".to_string(),
+        host_key: server.host_key,
+    }))
+}
+
+async fn update_server(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(server_id): Path<String>,
+    Json(request): Json<UpdateServerRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !authenticated(&state, &headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "authentication required".to_string(),
+        ));
+    }
+    if request.name.trim().is_empty()
+        || request.host.trim().is_empty()
+        || request.username.trim().is_empty()
+        || request.port == 0
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name, host, username and valid port are required".to_string(),
+        ));
+    }
+    let old = state
+        .servers
+        .lock()
+        .map_err(|_| internal_error("server lock poisoned"))?
+        .get(&server_id)
+        .cloned()
+        .ok_or((StatusCode::NOT_FOUND, "server not found".to_string()))?;
+    let password = if request.password.is_empty() {
+        old.password.clone()
+    } else {
+        request.password.clone()
+    };
+    let candidate = ServerConfig {
+        name: request.name.trim().to_string(),
+        host: request.host.trim().to_string(),
+        port: request.port,
+        username: request.username.trim().to_string(),
+        password,
+        host_key: old.host_key.clone(),
+    };
+    let preferred_interface = state
+        .db
+        .lock()
+        .map_err(|_| internal_error("database lock poisoned"))
+        .map(|db| network_interface_preference(&db))?;
+    let scanned = scan_target_host_key(&candidate, preferred_interface)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("unable to verify target host key: {error}"),
+            )
+        })?;
+    let key = state
+        .encryption_key
+        .lock()
+        .map_err(|_| internal_error("key lock poisoned"))?
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "authentication required".to_string(),
+        ))?;
+    let (ciphertext, nonce) = encrypt_secret(&key, &candidate.password).map_err(internal_error)?;
+    state.db.lock().map_err(|_| internal_error("database lock poisoned"))?.execute(
+        "UPDATE servers SET name=?1, host=?2, port=?3, username=?4, password_ciphertext=?5, password_nonce=?6, host_key=?7 WHERE id=?8",
+        params![candidate.name, candidate.host, candidate.port as i64, candidate.username, ciphertext, nonce, scanned, server_id],
+    ).map_err(internal_error)?;
+    state
+        .servers
+        .lock()
+        .map_err(|_| internal_error("server lock poisoned"))?
+        .insert(
+            server_id,
+            ServerConfig {
+                host_key: Some(scanned),
+                ..candidate
+            },
+        );
     Ok(StatusCode::NO_CONTENT)
 }
 

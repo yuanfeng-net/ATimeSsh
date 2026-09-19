@@ -13,6 +13,7 @@ import {
   Monitor,
   Network,
   Plus,
+  Pencil,
   RefreshCw,
   Search,
   Settings,
@@ -71,12 +72,37 @@ function formatTime(seconds: number) {
   return `${minutes}:${remainder}`
 }
 
+function maskHost(host: string) {
+  const parts = host.split('.')
+  if (parts.length === 4 && parts.every((part) => /^\d+$/.test(part))) {
+    return `${parts[0]}.**.**.${parts[3]}`
+  }
+  return host
+}
+
 async function createSessionFromHost(serverId: string): Promise<Session> {
   const response = await fetch(`/api/servers/${encodeURIComponent(serverId)}/ssh-sessions`, { method: 'POST' })
   if (!response.ok) {
     if (response.status === 412) throw new Error('host-key-required')
     throw new Error(`session creation failed: ${response.status}`)
   }
+  const payload = await response.json() as { session_id: string; server_id: string; port: number; token: string; connect_command: string; connect_uri: string; expires_at: number; max_expires_at: number }
+  return {
+    sessionId: payload.session_id,
+    serverId: payload.server_id,
+    port: payload.port,
+    token: payload.token,
+    command: payload.connect_command,
+    link: payload.connect_uri,
+    expiresAt: payload.expires_at * 1000,
+    maxExpiresAt: payload.max_expires_at * 1000,
+  }
+}
+
+async function fetchSessionFromHost(serverId: string): Promise<Session | null> {
+  const response = await fetch(`/api/servers/${encodeURIComponent(serverId)}/ssh-sessions`)
+  if (response.status === 404) return null
+  if (!response.ok) throw new Error(`session lookup failed: ${response.status}`)
   const payload = await response.json() as { session_id: string; server_id: string; port: number; token: string; connect_command: string; connect_uri: string; expires_at: number; max_expires_at: number }
   return {
     sessionId: payload.session_id,
@@ -141,6 +167,8 @@ function App() {
   const [sessions, setSessions] = useState<Record<string, Session>>({})
   const [now, setNow] = useState(Date.now())
   const [isAddOpen, setIsAddOpen] = useState(false)
+  const [editingNode, setEditingNode] = useState<ServerNode | null>(null)
+  const [editingUsername, setEditingUsername] = useState('')
   const [isSidebarOpen, setIsSidebarOpen] = useState(false)
   const [copied, setCopied] = useState(false)
   const [notice, setNotice] = useState('')
@@ -207,6 +235,19 @@ function App() {
       .then((serverList) => {
         setNodes(serverList)
         setSelectedId((current) => serverList.some((server) => server.id === current) ? current : (serverList[0]?.id ?? ''))
+        void Promise.all(serverList.map(async (server) => {
+          try {
+            return [server.id, await fetchSessionFromHost(server.id)] as const
+          } catch {
+            return [server.id, null] as const
+          }
+        })).then((entries) => {
+          const restored = entries.reduce<Record<string, Session>>((accumulator, [serverId, restoredSession]) => {
+            if (restoredSession) accumulator[serverId] = restoredSession
+            return accumulator
+          }, {})
+          setSessions(restored)
+        })
       })
       .catch(() => undefined)
     setNetworkLoading(true)
@@ -351,6 +392,31 @@ function App() {
     }
   }
 
+  async function editNode(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!editingNode) return
+    const data = new FormData(event.currentTarget)
+    const body = {
+      name: String(data.get('name') ?? '').trim().toUpperCase().replace(/\s+/g, '_'),
+      host: String(data.get('host') ?? '').trim(),
+      port: Number(data.get('port') ?? 22),
+      username: String(data.get('username') ?? '').trim(),
+      password: String(data.get('password') ?? ''),
+    }
+    setNotice(t('nodeSaving'))
+    try {
+      const response = await fetch(`/api/servers/${encodeURIComponent(editingNode.id)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      if (!response.ok) throw new Error((await response.text()).trim() || 'server update failed')
+      const serverList = await fetchServersFromHost()
+      setNodes(serverList)
+      setIsAddOpen(false)
+      setEditingNode(null)
+      setNotice(t('nodeUpdated'))
+    } catch (error) {
+      setNotice(`${t('nodeUpdateFailed')}: ${error instanceof Error ? error.message : ''}`)
+    }
+  }
+
   async function saveNetworkSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     setNetworkSaving(true)
@@ -398,7 +464,7 @@ function App() {
             {filteredNodes.map((node) => (
               <button key={node.id} className={`node-item ${node.id === selectedId ? 'selected' : ''}`} onClick={() => { setView('dashboard'); setSelectedId(node.id); setIsSidebarOpen(false) }}>
                 <span className={`status-dot ${node.status}`} />
-                <span className="node-copy"><strong>{node.name}</strong><small>{node.host}:{node.port}</small><em>{node.status === 'offline' ? t('offline') : node.status.toUpperCase()}</em></span>
+                <span className="node-copy"><strong>{node.name}</strong><small>{maskHost(node.host)}:{node.port}</small><em>{node.status === 'offline' ? t('offline') : node.status.toUpperCase()}</em></span>
               </button>
             ))}
             {filteredNodes.length === 0 && <div className="empty-search">{t('noMatchingNodes')}</div>}
@@ -413,9 +479,9 @@ function App() {
             <div>
               <div className="eyebrow"><span className={`status-dot ${selectedNode.status}`} /> {t('node')} / {selectedNode.environment}</div>
               <h1>{selectedNode.name}</h1>
-              <p>{selectedNode.host} <span>·</span> {t('lastSeen')} {selectedNode.lastSeen}</p>
+              <p>{maskHost(selectedNode.host)} <span>·</span> {t('lastSeen')} {selectedNode.lastSeen}</p>
             </div>
-            <button className="primary-button" onClick={generateSession} disabled={!selectedNode.hostKey}><KeyRound size={16} /> {t('generateTempLink')}</button>
+            <div className="node-header-actions"><button className="secondary-button" onClick={async () => { try { const response = await fetch(`/api/servers/${encodeURIComponent(selectedNode.id)}`); const details = await response.json() as { username: string }; setEditingUsername(details.username); setEditingNode(selectedNode); setIsAddOpen(true) } catch { setNotice(t('nodeUpdateFailed')) } }}><Pencil size={15} /> {t('editNode')}</button><button className="primary-button" onClick={generateSession} disabled={!selectedNode.hostKey}><KeyRound size={16} /> {t('generateTempLink')}</button></div>
           </section>
 
           <section className="metrics-grid">
@@ -442,7 +508,7 @@ function App() {
       </div>
 
       {notice && <div className="toast"><Check size={15} /> {notice}</div>}
-      {isAddOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsAddOpen(false) }}><div className="modal"><div className="modal-header"><div><span className="eyebrow">{t('nodeRegistry')}</span><h2>{t('addNewNode')}</h2></div><button className="icon-button" onClick={() => setIsAddOpen(false)} aria-label="Close dialog"><X size={18} /></button></div><form onSubmit={addNode}><label>{t('nodeName')}<input name="name" placeholder="e.g. FRANKFURT_API" autoFocus required /></label><div className="form-row host-port-row"><label>{t('hostIp')}<input name="host" placeholder="203.0.113.40" required /></label><label>{t('sshPort')}<input name="port" type="number" defaultValue="22" min="1" max="65535" required /></label></div><label>{t('username')}<input name="username" placeholder={t('encryptedLocally')} required /></label><label>{t('password')}<input name="password" type="password" placeholder={t('encryptedLocally')} required /></label><div className="form-note"><ShieldCheck size={15} /> {t('credentialsNeverShown')}</div><button className="primary-button modal-submit" type="submit"><Plus size={16} /> {t('addNode')}</button></form></div></div>}
+      {isAddOpen && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) { setIsAddOpen(false); setEditingNode(null) } }}><div className="modal"><div className="modal-header"><div><span className="eyebrow">{t('nodeRegistry')}</span><h2>{editingNode ? t('editNode') : t('addNewNode')}</h2></div><button className="icon-button" onClick={() => { setIsAddOpen(false); setEditingNode(null) }} aria-label="Close dialog"><X size={18} /></button></div><form onSubmit={editingNode ? editNode : addNode}><label>{t('nodeName')}<input name="name" defaultValue={editingNode?.name} placeholder="e.g. FRANKFURT_API" autoFocus required /></label><div className="form-row host-port-row"><label>{t('hostIp')}<input name="host" defaultValue={editingNode?.host} placeholder="203.0.113.40" required /></label><label>{t('sshPort')}<input name="port" type="number" defaultValue={editingNode?.port ?? 22} min="1" max="65535" required /></label></div><label>{t('username')}<input name="username" defaultValue={editingNode ? editingUsername : undefined} placeholder={t('encryptedLocally')} required /></label><label>{t('password')}<input name="password" type="password" placeholder={editingNode ? t('passwordOptional') : t('encryptedLocally')} required={!editingNode} /></label><div className="form-note"><ShieldCheck size={15} /> {editingNode ? t('editCredentialsHint') : t('credentialsNeverShown')}</div><button className="primary-button modal-submit" type="submit">{editingNode ? <Pencil size={16} /> : <Plus size={16} />} {editingNode ? t('saveChanges') : t('addNode')}</button></form></div></div>}
     </div>
   )
 }

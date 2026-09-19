@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing or new version tag to build, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: atimesh-windows-x86_64.zip
+            platform: windows
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            archive: atimesh-macos-x86_64.tar.gz
+            platform: macos
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            archive: atimesh-macos-aarch64.tar.gz
+            platform: macos
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: atimesh-linux-x86_64.tar.gz
+            platform: linux
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native-host
+          key: ${{ matrix.target }}
+
+      - name: Build native host
+        run: cargo build --manifest-path native-host/Cargo.toml --release --target ${{ matrix.target }}
+
+      - name: Package Windows release
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item "native-host/target/${{ matrix.target }}/release/atimesh-host.exe" "release/atimesh-host.exe"
+          Compress-Archive -Path "release/atimesh-host.exe" -DestinationPath "release/${{ matrix.archive }}"
+
+      - name: Package macOS release
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/ATimeSsh.app/Contents/MacOS
+          cp "native-host/target/${{ matrix.target }}/release/atimesh-host" release/ATimeSsh.app/Contents/MacOS/atimesh-host
+          cp packaging/macos/Info.plist release/ATimeSsh.app/Contents/Info.plist
+          chmod +x release/ATimeSsh.app/Contents/MacOS/atimesh-host
+          tar -czf "release/${{ matrix.archive }}" -C release ATimeSsh.app
+
+      - name: Package Linux release
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/ATimeSsh
+          cp "native-host/target/${{ matrix.target }}/release/atimesh-host" release/ATimeSsh/atimesh-host
+          cp packaging/linux/atimesh.desktop release/ATimeSsh/atimesh.desktop
+          chmod +x release/ATimeSsh/atimesh-host
+          tar -czf "release/${{ matrix.archive }}" -C release ATimeSsh
+
+      - name: Upload packaged release
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: release/${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged releases
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find release-assets -type f \( -name '*.zip' -o -name '*.tar.gz' \) -print)
+          test "${#assets[@]}" -eq 4
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --title "ATimeSsh $RELEASE_TAG" --generate-notes
+          fi
