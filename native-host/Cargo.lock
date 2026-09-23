@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "atimesh-host"
-version = "0.1.0"
+version = "0.1.3"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2 0.5.3",
@@ -136,6 +136,7 @@ dependencies = [
  "bytes",
  "dirs",
  "if-addrs",
+ "libc",
  "mime_guess",
  "rand",
  "rusqlite",

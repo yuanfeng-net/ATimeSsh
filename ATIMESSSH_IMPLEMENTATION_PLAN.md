@@ -24,8 +24,8 @@ ATimeSsh 可执行文件
 ├─ AES-256-GCM 凭据加密
 ├─ russh SSH 连接与 Relay
 ├─ React + TypeScript + Vite 管理后台
-├─ Tailwind CSS 样式系统
-├─ WebSocket 浏览器终端
+├─ CSS 样式系统
+├─ SSH URI / 外部终端 Relay
 └─ rust-embed 嵌入前端静态资源
 ```
 
@@ -33,7 +33,7 @@ ATimeSsh 可执行文件
 
 | 层次 | 技术 | 用途 |
 | --- | --- | --- |
-| 服务端 | Rust、Tokio、Axum | 异步服务、HTTP API、WebSocket |
+| 服务端 | Rust、Tokio、Axum | 异步服务和 HTTP API |
 | SSH | `russh` | 跨平台 SSH 客户端和临时 Relay |
 | 数据库 | SQLite、`rusqlite` `bundled` | 本地配置和服务器数据 |
 | 密码 | `argon2` | 安全密码哈希 |
@@ -41,8 +41,8 @@ ATimeSsh 可执行文件
 | 路径 | `directories` | 获取各平台应用数据目录 |
 | 浏览器 | `webbrowser` | 跨平台自动打开浏览器 |
 | 前端 | React、TypeScript、Vite | 管理后台 |
-| 样式 | Tailwind CSS | 布局、响应式和主题 |
-| 状态 | Zustand | 登录、服务器和会话状态 |
+| 样式 | CSS | 布局、响应式和主题 |
+| 状态 | React state | 登录、服务器和会话状态 |
 | 图标 | `lucide-react` | 操作栏和状态图标 |
 | 静态资源 | `rust-embed` | 将 React 构建结果嵌入 Rust 二进制 |
 
@@ -58,11 +58,11 @@ ATimeSsh 可执行文件
 - 由安全密码和独立盐值派生 AES-256-GCM 密钥，服务器 SSH 密码以密文和随机 nonce 写入 SQLite，前端不接收账号密码。
 - 前端提供首启设置、登录锁屏、锁定按钮，并保留中英文切换和深浅色模式。
 - 管理端口和每个活动服务器会话的 Relay 端口仍由操作系统随机分配，旧会话撤销时释放端口。
-- SSH 目标连接优先枚举并绑定物理网卡地址，排除常见 TUN、VPN、WSL、Docker、Clash、Meta TUN 等虚拟接口；Windows 额外使用网卡接口索引设置 `IP_UNICAST_IF`/`IPV6_UNICAST_IF`，避免仅绑定源 IP 仍被 TUN 默认路由接管；物理接口全部失败后才回退到系统默认路由，扫描和 Relay 使用同一连接策略。
+- SSH 目标连接优先枚举并绑定物理网卡地址，排除常见 TUN、VPN、WSL、Docker、Clash、Meta TUN 等虚拟接口；手动选择时 Windows/Linux/macOS 均绑定指定接口，接口不可用则失败，不静默回退到默认路由。
 - 管理后台设置页支持网络出口选择：默认自动选择，亦可从已枚举的物理网卡中手动指定；偏好写入 SQLite `app_config.network_interface_index`，只影响后续主机指纹扫描和新建 Relay，当前会话不会被中断。`GET /api/network/interfaces`、`GET/POST /api/settings/network` 均要求已认证 Cookie。
 - 服务器列表已增加受保护的 `GET /api/servers`，登录后从 SQLite 加载脱敏节点信息；新增节点会保存名称、地址和加密凭据，空数据库显示空列表。
 
-当前待补齐项：基于测试 SSH Server 的端到端 Relay 测试，以及移除生产环境的前端 mock fallback。
+当前验证要求：Relay 请求回执、EOF/exit-status 顺序、PTY、多 channel 和会话撤销必须通过自动化测试；生产前端不包含 mock 节点或 mock 会话。
 
 目标服务器主机指纹已合并到服务器保存流程：保存前自动完成 SSH 握手、读取目标 SSH 公钥的 SHA-256 指纹并验证提交的账号密码，成功后写入 `servers.host_key`；握手、认证或指纹读取失败时保存请求直接失败，不会写入未验证的服务器。已有服务器再次保存时如果指纹变化也会拒绝覆盖；Relay 后续连接时指纹不匹配会拒绝连接。
 
@@ -99,9 +99,9 @@ ATimeSsh 可执行文件
 安全要求：
 
 - 不保存明文安全密码。
-- 登录失败进行限速。
+- 登录失败使用指数退避限速，连续失败最长锁定 60 秒。
 - Cookie 设置 `HttpOnly`、`SameSite=Strict`，本地服务可启用 `Secure`。
-- 会话具有过期时间，退出时服务端主动失效。
+- 会话具有过期时间，锁定后台时服务端主动撤销全部 Relay。
 - 忘记安全密码时只能清空本地数据并重新初始化。
 
 ## 4. 本地数据和加密
@@ -109,7 +109,7 @@ ATimeSsh 可执行文件
 ### 4.1 跨平台数据目录
 
 ```text
-Windows: %APPDATA%\\ATimeSsh
+Windows: %USERPROFILE%\\ATimeSsh
 macOS:   ~/Library/Application Support/ATimeSsh
 Linux:   $XDG_DATA_HOME/ATimeSsh，未设置时为 ~/.local/share/ATimeSsh
 ```
@@ -174,12 +174,12 @@ CREATE TABLE ssh_sessions (
 
 技术约定：
 
-- React Router 管理初始化、登录和后台路由。
-- Zustand 管理认证状态、服务器选中状态和临时会话状态。
-- 使用 `fetch` 或 Axios 调用 Rust API。
-- 使用 React Portal 实现添加服务器弹窗。
+- 单页 React 组件管理初始化、登录和后台视图。
+- React state 管理认证状态、服务器选中状态和临时会话状态。
+- 使用 `fetch` 调用 Rust API。
+- 使用组件内条件渲染实现添加服务器弹窗。
 - 使用 Clipboard API 复制链接。
-- 使用 WebSocket 连接浏览器 SSH 终端。
+- 外部终端或 AI Agent 通过临时 SSH URI 连接 Relay。
 - 使用 `lucide-react` 图标表达添加、搜索、复制、续期、关闭和退出等操作。
 - 服务器密码和账号不返回给前端详情接口。
 
@@ -356,9 +356,9 @@ Rust 通过 `rust-embed` 提供 `frontend/dist`。生产包不携带 Node.js，N
 
 - 浏览器启动统一使用 `webbrowser`。
 - 信号处理同时覆盖 Windows Ctrl+C、macOS/Linux SIGINT 和 SIGTERM。
-- SSH 主机指纹保存到应用自己的 `known_hosts` 文件，不依赖系统 OpenSSH 配置。
+- SSH 主机指纹保存到 SQLite 的 `servers.host_key`，不依赖系统 OpenSSH 配置。
 - 所有文件操作使用 Rust 跨平台路径 API。
-- Linux/macOS 数据目录限制为当前用户可读写；Windows 使用用户 AppData。
+- Linux/macOS 数据目录限制为当前用户可读写；Windows 使用用户主目录下的 `ATimeSsh`，更新或重装程序不会删除数据库。
 
 ## 9. 项目结构
 
@@ -396,7 +396,7 @@ atimesh/
 
 - `russh` 连接目标服务器。
 - Token 生成、哈希存储和过期校验。
-- 浏览器 WebSocket SSH 终端。
+- SSH Relay 的真实端到端测试和协议顺序回归测试。
 - 倒计时、复制、续期和关闭。
 - 会话断开、到期和程序退出清理。
 
@@ -496,7 +496,7 @@ listener_handle
 revoked_at
 ```
 
-宿主层已经提供 `native-host/`：Web 服务使用操作系统随机端口，临时会话持有独立端口租约，并包含系统托盘菜单。当前 Relay 已使用 `russh` 启动真正的 SSH 服务端并用临时 Token 做密码认证；服务器注册 API 会把目标 SSH 配置绑定到 `server_id`，认证成功后由 `russh` client 连接目标主机，并通过双向 `copy_bidirectional` 转发交互式 PTY 数据。当前 `ServerConfig.password` 仍是宿主内存字段，下一步替换为 SQLite 中由安全密码派生密钥解密后的临时值，并补充 `known_hosts` 指纹比对。
+宿主层已经提供 `native-host/`：Web 服务使用操作系统随机端口，临时会话持有独立端口租约，并包含系统托盘菜单。Relay 使用 `russh` 启动真正的 SSH 服务端并用临时 Token 做密码认证；服务器注册 API 将目标 SSH 配置绑定到 `server_id`，认证成功后由 `russh` client 连接目标主机，并通过双向 channel 转发 PTY 数据。`ServerConfig.password` 运行时只存在于宿主内存，持久化数据使用安全密码派生密钥加密，并校验目标主机指纹。
 
 Relay 对客户端的 `pty-request` 和 `shell-request` 会显式返回 SSH channel success，避免 OpenSSH 在临时 Token 认证成功后因终端协商未完成而立即断开。
 

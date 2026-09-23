@@ -9,7 +9,7 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -32,7 +32,7 @@ use std::{
     fs,
     io::Write,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -49,17 +49,19 @@ use tray_icon::{
 use uuid::Uuid;
 
 const DEFAULT_HOST: &str = "127.0.0.1";
+const SESSION_MAX_DURATION: Duration = Duration::from_secs(48 * 60 * 60);
 
 fn log_message(message: impl AsRef<str>) {
-    let mut dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    dir.push("ATimeSsh");
+    let dir = app_data_dir();
     if fs::create_dir_all(&dir).is_err() {
         return;
     }
+    let _ = harden_path(&dir, 0o700);
     let path = dir.join("atimesh.log");
     let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path) else {
         return;
     };
+    let _ = harden_path(&dir.join("atimesh.log"), 0o600);
     let _ = writeln!(
         file,
         "[{}] {}",
@@ -80,7 +82,16 @@ struct AppState {
     db: Arc<Mutex<Connection>>,
     auth_sessions: Arc<Mutex<HashMap<String, SystemTime>>>,
     encryption_key: Arc<Mutex<Option<[u8; 32]>>>,
+    login_throttle: Arc<Mutex<LoginThrottle>>,
 }
+
+#[derive(Default)]
+struct LoginThrottle {
+    failures: u32,
+    blocked_until: Option<SystemTime>,
+}
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Deserialize)]
 struct ServerConfig {
@@ -212,6 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db,
         auth_sessions: Arc::new(Mutex::new(HashMap::new())),
         encryption_key: Arc::new(Mutex::new(None)),
+        login_throttle: Arc::new(Mutex::new(LoginThrottle::default())),
     };
     let dashboard_url = format!("http://{DEFAULT_HOST}:{app_port}/");
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -248,6 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/api/ssh-sessions/{session_id}/renew", post(renew_session))
             .route("/api/ssh-sessions/{session_id}/status", get(session_status))
             .fallback(static_asset)
+            .layer(DefaultBodyLimit::max(64 * 1024))
             .with_state(api_state);
         let result = axum::serve(app_listener, app)
             .with_graceful_shutdown(async {
@@ -271,12 +284,27 @@ async fn runtime(State(state): State<AppState>) -> Json<RuntimeResponse> {
 }
 
 fn init_database() -> Result<Connection, rusqlite::Error> {
-    let mut dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    dir.push("ATimeSsh");
-    let _ = fs::create_dir_all(&dir);
+    let dir = app_data_dir();
+    migrate_legacy_data_dir(&dir)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    fs::create_dir_all(&dir)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    harden_path(&dir, 0o700)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let path = dir.join("atimesh.sqlite3");
+    if !path.exists() {
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    }
+    harden_path(&path, 0o600)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let connection = Connection::open(path)?;
     connection.execute_batch("PRAGMA journal_mode = WAL;")?;
+    let _ = harden_path(&dir.join("atimesh.sqlite3-wal"), 0o600);
+    let _ = harden_path(&dir.join("atimesh.sqlite3-shm"), 0o600);
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS servers (
            id TEXT PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL,
@@ -316,6 +344,65 @@ fn init_database() -> Result<Connection, rusqlite::Error> {
          DELETE FROM ssh_sessions;",
     )?;
     Ok(connection)
+}
+
+fn app_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(home) = dirs::home_dir() {
+        return home.join("ATimeSsh");
+    }
+
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("ATimeSsh")
+}
+
+#[cfg(windows)]
+fn migrate_legacy_data_dir(target: &FsPath) -> std::io::Result<()> {
+    let Some(data_local) = dirs::data_local_dir() else {
+        return Ok(());
+    };
+    let legacy = data_local.join("ATimeSsh");
+    if legacy == target || !legacy.exists() {
+        return Ok(());
+    }
+
+    if !target.exists() {
+        if fs::rename(&legacy, target).is_ok() {
+            return Ok(());
+        }
+        fs::create_dir_all(target)?;
+    }
+
+    for entry in fs::read_dir(&legacy)? {
+        let entry = entry?;
+        let source = entry.path();
+        let destination = target.join(entry.file_name());
+        if destination.exists() || !source.is_file() {
+            continue;
+        }
+        fs::copy(source, destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn migrate_legacy_data_dir(_target: &FsPath) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_path(path: &FsPath, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if path.exists() {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_path(_path: &FsPath, _mode: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn config_value(db: &Connection, key: &str) -> Result<Option<Vec<u8>>, rusqlite::Error> {
@@ -404,6 +491,64 @@ fn authenticated(state: &AppState, headers: &HeaderMap) -> bool {
     true
 }
 
+fn origin_allowed(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    origin == format!("http://{DEFAULT_HOST}:{}", state.app_port)
+        || origin == format!("http://localhost:{}", state.app_port)
+}
+
+fn login_retry_after(state: &AppState) -> Option<u64> {
+    let Ok(mut throttle) = state.login_throttle.lock() else {
+        return Some(60);
+    };
+    let blocked_until = throttle.blocked_until?;
+    if blocked_until <= SystemTime::now() {
+        throttle.blocked_until = None;
+        return None;
+    }
+    blocked_until
+        .duration_since(SystemTime::now())
+        .ok()
+        .map(|duration| duration.as_secs().max(1))
+}
+
+fn record_login_failure(state: &AppState) {
+    if let Ok(mut throttle) = state.login_throttle.lock() {
+        throttle.failures = throttle.failures.saturating_add(1);
+        let delay = 2_u64.saturating_pow(throttle.failures.min(6));
+        throttle.blocked_until = Some(SystemTime::now() + Duration::from_secs(delay.min(60)));
+    }
+}
+
+fn reset_login_throttle(state: &AppState) {
+    if let Ok(mut throttle) = state.login_throttle.lock() {
+        *throttle = LoginThrottle::default();
+    }
+}
+
+fn valid_ssh_username(username: &str) -> bool {
+    !username.is_empty()
+        && username
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn encode_uri_component(value: &str) -> String {
+    value.bytes().fold(String::new(), |mut encoded, byte| {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+        encoded
+    })
+}
+
 fn auth_error(status: StatusCode, message: &str) -> (StatusCode, Json<ErrorResponse>) {
     (
         status,
@@ -486,25 +631,30 @@ async fn list_servers(
     Ok(Json(summaries))
 }
 
-async fn auth_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Json<AuthStatusResponse> {
+async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let configured = state
         .db
         .lock()
         .map(|db| is_configured(&db))
         .unwrap_or(false);
-    Json(AuthStatusResponse {
-        configured,
-        authenticated: configured && authenticated(&state, &headers),
-    })
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(AuthStatusResponse {
+            configured,
+            authenticated: configured && authenticated(&state, &headers),
+        }),
+    )
+        .into_response()
 }
 
 async fn auth_setup(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<AuthRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    if !origin_allowed(&state, &headers) {
+        return Err(auth_error(StatusCode::FORBIDDEN, "invalid request origin"));
+    }
     if request.password.chars().count() < 8 {
         return Err(auth_error(
             StatusCode::BAD_REQUEST,
@@ -568,8 +718,18 @@ async fn auth_setup(
 
 async fn auth_login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<AuthRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    if !origin_allowed(&state, &headers) {
+        return Err(auth_error(StatusCode::FORBIDDEN, "invalid request origin"));
+    }
+    if let Some(retry_after) = login_retry_after(&state) {
+        return Err(auth_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!("too many failed logins; retry in {retry_after} seconds"),
+        ));
+    }
     let db = state
         .db
         .lock()
@@ -590,6 +750,7 @@ async fn auth_login(
         .verify_password(request.password.as_bytes(), &parsed)
         .is_err()
     {
+        record_login_failure(&state);
         return Err(auth_error(
             StatusCode::UNAUTHORIZED,
             "invalid security password",
@@ -605,6 +766,7 @@ async fn auth_login(
         })?;
     let key = derive_key(&request.password, &salt)
         .map_err(|error| auth_error(StatusCode::INTERNAL_SERVER_ERROR, &error))?;
+    reset_login_throttle(&state);
     let servers = load_servers(&db, &key)
         .map_err(|error| auth_error(StatusCode::INTERNAL_SERVER_ERROR, &error))?;
     drop(db);
@@ -638,19 +800,46 @@ async fn auth_login(
     Ok(response)
 }
 
-async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
+async fn auth_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !origin_allowed(&state, &headers) {
+        return Err((StatusCode::FORBIDDEN, "invalid request origin".to_string()));
+    }
     if let Some(token) = cookie_token(&headers) {
-        if let Ok(mut sessions) = state.auth_sessions.lock() {
-            sessions.remove(&token);
-        }
+        state
+            .auth_sessions
+            .lock()
+            .map_err(|_| internal_error("session lock poisoned"))?
+            .remove(&token);
     }
-    if let Ok(mut key) = state.encryption_key.lock() {
-        *key = None;
+    *state
+        .encryption_key
+        .lock()
+        .map_err(|_| internal_error("key lock poisoned"))? = None;
+    state
+        .servers
+        .lock()
+        .map_err(|_| internal_error("server lock poisoned"))?
+        .clear();
+    let expired = state
+        .leases
+        .lock()
+        .map_err(|_| internal_error("lease lock poisoned"))?
+        .drain()
+        .map(|(_, lease)| lease.relay_task)
+        .collect::<Vec<_>>();
+    for relay_task in expired {
+        relay_task.abort();
     }
-    if let Ok(mut servers) = state.servers.lock() {
-        servers.clear();
-    }
-    StatusCode::NO_CONTENT
+    state
+        .db
+        .lock()
+        .map_err(|_| internal_error("database lock poisoned"))?
+        .execute("DELETE FROM ssh_sessions", [])
+        .map_err(|error| internal_error(error.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn network_interface_preference(db: &Connection) -> Option<u32> {
@@ -727,6 +916,9 @@ async fn get_network_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<NetworkSettingsResponse>, (StatusCode, String)> {
+    if !origin_allowed(&state, &headers) {
+        return Err((StatusCode::FORBIDDEN, "invalid request origin".to_string()));
+    }
     if !authenticated(&state, &headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -753,6 +945,9 @@ async fn set_network_settings(
     headers: HeaderMap,
     Json(request): Json<NetworkSettingsRequest>,
 ) -> Result<Json<NetworkSettingsResponse>, (StatusCode, String)> {
+    if !origin_allowed(&state, &headers) {
+        return Err((StatusCode::FORBIDDEN, "invalid request origin".to_string()));
+    }
     if !authenticated(&state, &headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -802,6 +997,9 @@ async fn create_session(
     headers: HeaderMap,
     Path(server_id): Path<String>,
 ) -> Result<Json<SessionResponse>, (StatusCode, String)> {
+    if !origin_allowed(&state, &headers) {
+        return Err((StatusCode::FORBIDDEN, "invalid request origin".to_string()));
+    }
     if !authenticated(&state, &headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -839,7 +1037,7 @@ async fn create_session(
     let token = Uuid::new_v4().simple().to_string();
     let relay_username = target.username.clone();
     let expires_at = SystemTime::now() + Duration::from_secs(10 * 60);
-    let max_expires_at = SystemTime::now() + Duration::from_secs(60 * 60);
+    let max_expires_at = SystemTime::now() + SESSION_MAX_DURATION;
     let relay_task = spawn_relay(listener, token.clone(), target, preferred_interface);
     let session = SessionLease {
         server_id: server_id.clone(),
@@ -859,18 +1057,39 @@ async fn create_session(
         .iter()
         .find(|(_, lease)| lease.server_id == server_id)
         .map(|(id, _)| id.clone());
+    let db_result = state
+        .db
+        .lock()
+        .map_err(|_| internal_error("database lock poisoned"))
+        .and_then(|mut db| {
+            let transaction = db
+                .transaction()
+                .map_err(|error| internal_error(error.to_string()))?;
+            if let Some(old_session) = &old_session {
+                transaction
+                    .execute("DELETE FROM ssh_sessions WHERE id = ?1", [old_session])
+                    .map_err(|error| internal_error(error.to_string()))?;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO ssh_sessions(id, server_id, port, token_hash, expires_at, max_expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![session_id, server_id, port as i64, hash_session_token(&token).to_vec(), epoch_seconds(expires_at) as i64, epoch_seconds(max_expires_at) as i64],
+                )
+                .map_err(|error| internal_error(error.to_string()))?;
+            transaction
+                .commit()
+                .map_err(|error| internal_error(error.to_string()))
+        });
+    if let Err(error) = db_result {
+        session.relay_task.abort();
+        return Err(error);
+    }
     if let Some(old_session) = old_session {
         if let Some(old_lease) = leases.remove(&old_session) {
             old_lease.relay_task.abort();
         }
     }
     leases.insert(session_id.clone(), session);
-    if let Ok(db) = state.db.lock() {
-        let _ = db.execute(
-            "INSERT INTO ssh_sessions(id, server_id, port, token_hash, expires_at, max_expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![session_id, server_id, port as i64, hash_session_token(&token).to_vec(), epoch_seconds(expires_at) as i64, epoch_seconds(max_expires_at) as i64],
-        );
-    }
 
     Ok(Json(SessionResponse {
         session_id,
@@ -881,7 +1100,10 @@ async fn create_session(
             "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{DEFAULT_HOST} -p {port}",
             relay_username.as_str()
         ),
-        connect_uri: format!("ssh://{}:{token}@{DEFAULT_HOST}:{port}", relay_username),
+        connect_uri: format!(
+            "ssh://{}:{token}@{DEFAULT_HOST}:{port}",
+            encode_uri_component(&relay_username)
+        ),
         expires_at: epoch_seconds(expires_at),
         max_expires_at: epoch_seconds(max_expires_at),
     }))
@@ -914,11 +1136,14 @@ async fn get_session(
         .map(|lease| lease.expires_at <= SystemTime::now())
         .unwrap_or(true)
     {
+        state
+            .db
+            .lock()
+            .map_err(|_| internal_error("database lock poisoned"))?
+            .execute("DELETE FROM ssh_sessions WHERE id = ?1", [&session_id])
+            .map_err(|error| internal_error(error.to_string()))?;
         if let Some(lease) = leases.remove(&session_id) {
             lease.relay_task.abort();
-        }
-        if let Ok(db) = state.db.lock() {
-            let _ = db.execute("DELETE FROM ssh_sessions WHERE id = ?1", [&session_id]);
         }
         return Err((StatusCode::NOT_FOUND, "session not found".to_string()));
     }
@@ -943,7 +1168,12 @@ async fn get_session(
             "ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no {}@{DEFAULT_HOST} -p {}",
             username, lease.port
         ),
-        connect_uri: format!("ssh://{}:{}@{DEFAULT_HOST}:{}", username, lease.token, lease.port),
+        connect_uri: format!(
+            "ssh://{}:{}@{DEFAULT_HOST}:{}",
+            encode_uri_component(&username),
+            lease.token,
+            lease.port
+        ),
         expires_at: epoch_seconds(lease.expires_at),
         max_expires_at: epoch_seconds(lease.max_expires_at),
     }))
@@ -955,6 +1185,9 @@ async fn upsert_server(
     Path(server_id): Path<String>,
     Json(server): Json<ServerConfig>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if !origin_allowed(&state, &headers) {
+        return Err((StatusCode::FORBIDDEN, "invalid request origin".to_string()));
+    }
     if !authenticated(&state, &headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -968,6 +1201,12 @@ async fn upsert_server(
         return Err((
             StatusCode::BAD_REQUEST,
             "host, username and password are required".to_string(),
+        ));
+    }
+    if !valid_ssh_username(server.username.trim()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "username may contain only letters, digits, '.', '_' and '-'".to_string(),
         ));
     }
     if server.port == 0 {
@@ -1023,7 +1262,8 @@ async fn upsert_server(
         .servers
         .lock()
         .map_err(|_| internal_error("server lock poisoned"))?
-        .insert(server_id, server);
+        .insert(server_id.clone(), server);
+    revoke_server_leases(&state, &server_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1062,6 +1302,9 @@ async fn update_server(
     Path(server_id): Path<String>,
     Json(request): Json<UpdateServerRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if !origin_allowed(&state, &headers) {
+        return Err((StatusCode::FORBIDDEN, "invalid request origin".to_string()));
+    }
     if !authenticated(&state, &headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -1076,6 +1319,12 @@ async fn update_server(
         return Err((
             StatusCode::BAD_REQUEST,
             "name, host, username and valid port are required".to_string(),
+        ));
+    }
+    if !valid_ssh_username(request.username.trim()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "username may contain only letters, digits, '.', '_' and '-'".to_string(),
         ));
     }
     let old = state
@@ -1129,12 +1378,13 @@ async fn update_server(
         .lock()
         .map_err(|_| internal_error("server lock poisoned"))?
         .insert(
-            server_id,
+            server_id.clone(),
             ServerConfig {
                 host_key: Some(scanned),
                 ..candidate
             },
         );
+    revoke_server_leases(&state, &server_id)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1143,6 +1393,9 @@ async fn renew_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<Json<SessionStatusResponse>, (StatusCode, String)> {
+    if !origin_allowed(&state, &headers) {
+        return Err((StatusCode::FORBIDDEN, "invalid request origin".to_string()));
+    }
     if !authenticated(&state, &headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -1153,22 +1406,33 @@ async fn renew_session(
         .leases
         .lock()
         .map_err(|_| internal_error("lease lock poisoned"))?;
+    let (current_expires_at, max_expires_at) = leases
+        .get_mut(&session_id)
+        .map(|lease| (lease.expires_at, lease.max_expires_at))
+        .ok_or((StatusCode::NOT_FOUND, "session not found".to_string()))?;
+    if current_expires_at <= SystemTime::now() {
+        return Err((StatusCode::GONE, "session expired".to_string()));
+    }
+    let next_expires_at = std::cmp::min(
+        current_expires_at + Duration::from_secs(10 * 60),
+        max_expires_at,
+    );
+    let updated = state
+        .db
+        .lock()
+        .map_err(|_| internal_error("database lock poisoned"))?
+        .execute(
+            "UPDATE ssh_sessions SET expires_at = ?1 WHERE id = ?2",
+            params![epoch_seconds(next_expires_at) as i64, session_id],
+        )
+        .map_err(|error| internal_error(error.to_string()))?;
+    if updated != 1 {
+        return Err(internal_error("session persistence record is missing"));
+    }
     let lease = leases
         .get_mut(&session_id)
         .ok_or((StatusCode::NOT_FOUND, "session not found".to_string()))?;
-    if lease.expires_at <= SystemTime::now() {
-        return Err((StatusCode::GONE, "session expired".to_string()));
-    }
-    lease.expires_at = std::cmp::min(
-        lease.expires_at + Duration::from_secs(10 * 60),
-        lease.max_expires_at,
-    );
-    if let Ok(db) = state.db.lock() {
-        let _ = db.execute(
-            "UPDATE ssh_sessions SET expires_at = ?1 WHERE id = ?2",
-            params![epoch_seconds(lease.expires_at) as i64, session_id],
-        );
-    }
+    lease.expires_at = next_expires_at;
     Ok(Json(session_status_payload(&session_id, lease)))
 }
 
@@ -1192,6 +1456,12 @@ async fn session_status(
         .map(|lease| lease.expires_at <= SystemTime::now())
         .unwrap_or(false);
     if expired {
+        state
+            .db
+            .lock()
+            .map_err(|_| internal_error("database lock poisoned"))?
+            .execute("DELETE FROM ssh_sessions WHERE id = ?1", [&session_id])
+            .map_err(|error| internal_error(error.to_string()))?;
         if let Some(lease) = leases.remove(&session_id) {
             lease.relay_task.abort();
         }
@@ -1242,8 +1512,19 @@ async fn expire_sessions(
             for id in ids {
                 if let Some(lease) = guard.remove(&id) {
                     tasks.push(lease.relay_task);
-                    if let Ok(connection) = db.lock() {
-                        let _ = connection.execute("DELETE FROM ssh_sessions WHERE id = ?1", [&id]);
+                    match db.lock() {
+                        Ok(connection) => {
+                            if let Err(error) =
+                                connection.execute("DELETE FROM ssh_sessions WHERE id = ?1", [&id])
+                            {
+                                log_message(format!(
+                                    "Unable to delete expired SSH session {id}: {error}"
+                                ));
+                            }
+                        }
+                        Err(_) => log_message(
+                            "Unable to lock database while deleting expired SSH session",
+                        ),
                     }
                 }
             }
@@ -1286,6 +1567,9 @@ async fn revoke_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
+    if !origin_allowed(&state, &headers) {
+        return Err((StatusCode::FORBIDDEN, "invalid request origin".to_string()));
+    }
     if !authenticated(&state, &headers) {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -1296,19 +1580,53 @@ async fn revoke_session(
         .leases
         .lock()
         .map_err(|_| internal_error("lease lock poisoned"))?;
-    if let Some(lease) = leases.remove(&session_id) {
-        lease.relay_task.abort();
-        if let Ok(db) = state.db.lock() {
-            let _ = db.execute("DELETE FROM ssh_sessions WHERE id = ?1", [session_id]);
+    if !leases.contains_key(&session_id) {
+        Err((StatusCode::NOT_FOUND, "session not found".to_string()))
+    } else {
+        state
+            .db
+            .lock()
+            .map_err(|_| internal_error("database lock poisoned"))?
+            .execute("DELETE FROM ssh_sessions WHERE id = ?1", [&session_id])
+            .map_err(|error| internal_error(error.to_string()))?;
+        if let Some(lease) = leases.remove(&session_id) {
+            lease.relay_task.abort();
         }
         Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err((StatusCode::NOT_FOUND, "session not found".to_string()))
     }
 }
 
 fn internal_error(error: impl ToString) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+fn revoke_server_leases(state: &AppState, server_id: &str) -> Result<(), (StatusCode, String)> {
+    let mut leases = state
+        .leases
+        .lock()
+        .map_err(|_| internal_error("lease lock poisoned"))?;
+    let ids = leases
+        .iter()
+        .filter(|(_, lease)| lease.server_id == server_id)
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| internal_error("database lock poisoned"))?;
+    for id in &ids {
+        db.execute("DELETE FROM ssh_sessions WHERE id = ?1", [id])
+            .map_err(|error| internal_error(error.to_string()))?;
+    }
+    for id in ids {
+        if let Some(lease) = leases.remove(&id) {
+            lease.relay_task.abort();
+        }
+    }
+    Ok(())
 }
 
 fn open_dashboard(url: &str) {
@@ -1410,7 +1728,12 @@ impl RusshServer for RelayServer {
     }
 }
 
-enum TargetRequest {
+struct TargetRequest {
+    kind: TargetRequestKind,
+    reply: oneshot::Sender<bool>,
+}
+
+enum TargetRequestKind {
     Pty {
         term: String,
         col_width: u32,
@@ -1444,10 +1767,12 @@ struct RelayHandler {
     channels: Arc<Mutex<HashMap<ChannelId, mpsc::Sender<TargetRequest>>>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LocalSource {
     ip: IpAddr,
     interface_index: Option<u32>,
+    #[allow(dead_code)]
+    interface_name: String,
 }
 
 #[derive(Clone)]
@@ -1489,7 +1814,7 @@ impl server::Handler for RelayHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         if self
-            .send_target_request(channel, TargetRequest::Shell)
+            .send_target_request(channel, TargetRequestKind::Shell)
             .await
         {
             session.channel_success(channel)?;
@@ -1570,7 +1895,7 @@ impl server::Handler for RelayHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let _ = self
-            .send_target_request(channel, TargetRequest::Close)
+            .send_target_request(channel, TargetRequestKind::Close)
             .await;
         if let Ok(mut channels) = self.channels.lock() {
             channels.remove(&channel);
@@ -1583,7 +1908,9 @@ impl server::Handler for RelayHandler {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        let _ = self.send_target_request(channel, TargetRequest::Eof).await;
+        let _ = self
+            .send_target_request(channel, TargetRequestKind::Eof)
+            .await;
         Ok(())
     }
 
@@ -1596,7 +1923,7 @@ impl server::Handler for RelayHandler {
     ) -> Result<(), Self::Error> {
         self.respond_to_target_request(
             channel,
-            TargetRequest::Env {
+            TargetRequestKind::Env {
                 name: variable_name.to_string(),
                 value: variable_value.to_string(),
             },
@@ -1611,8 +1938,12 @@ impl server::Handler for RelayHandler {
         name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.respond_to_target_request(channel, TargetRequest::Subsystem(name.to_string()), session)
-            .await
+        self.respond_to_target_request(
+            channel,
+            TargetRequestKind::Subsystem(name.to_string()),
+            session,
+        )
+        .await
     }
 
     async fn window_change_request(
@@ -1626,7 +1957,7 @@ impl server::Handler for RelayHandler {
     ) -> Result<(), Self::Error> {
         self.respond_to_target_request(
             channel,
-            TargetRequest::WindowChange {
+            TargetRequestKind::WindowChange {
                 col_width,
                 row_height,
                 pix_width,
@@ -1644,7 +1975,7 @@ impl server::Handler for RelayHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         let _ = self
-            .send_target_request(channel, TargetRequest::Signal(signal))
+            .send_target_request(channel, TargetRequestKind::Signal(signal))
             .await;
         Ok(())
     }
@@ -1655,7 +1986,7 @@ impl server::Handler for RelayHandler {
         command: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.respond_to_target_request(channel, TargetRequest::Exec(command.to_vec()), session)
+        self.respond_to_target_request(channel, TargetRequestKind::Exec(command.to_vec()), session)
             .await
     }
 
@@ -1672,7 +2003,7 @@ impl server::Handler for RelayHandler {
     ) -> Result<(), Self::Error> {
         self.respond_to_target_request(
             channel,
-            TargetRequest::Pty {
+            TargetRequestKind::Pty {
                 term: term.to_string(),
                 col_width,
                 row_height,
@@ -1700,10 +2031,10 @@ impl RelayHandler {
     async fn respond_to_target_request(
         &self,
         channel: ChannelId,
-        request: TargetRequest,
+        kind: TargetRequestKind,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
-        if self.send_target_request(channel, request).await {
+        if self.send_target_request(channel, kind).await {
             session.channel_success(channel)?;
         } else {
             session.channel_failure(channel)?;
@@ -1711,16 +2042,23 @@ impl RelayHandler {
         Ok(())
     }
 
-    async fn send_target_request(&self, channel: ChannelId, request: TargetRequest) -> bool {
+    async fn send_target_request(&self, channel: ChannelId, kind: TargetRequestKind) -> bool {
+        let (reply, response) = oneshot::channel();
+        let request = TargetRequest { kind, reply };
         let sender = self
             .channels
             .lock()
             .ok()
             .and_then(|channels| channels.get(&channel).cloned());
-        match sender {
-            Some(sender) => sender.send(request).await.is_ok(),
-            None => false,
+        let Some(sender) = sender else { return false };
+        if sender.send(request).await.is_err() {
+            return false;
         }
+        tokio::time::timeout(REQUEST_TIMEOUT, response)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(false)
     }
 }
 
@@ -1732,29 +2070,29 @@ async fn relay_session(
     mut requests: mpsc::Receiver<TargetRequest>,
     target_session: client::Handle<TargetClient>,
 ) {
-    let mut client_open = true;
-    let mut target_open = true;
-
-    while client_open || target_open {
+    loop {
         tokio::select! {
-            request = requests.recv(), if target_open => {
+            request = requests.recv() => {
                 let Some(request) = request else { break };
-                let result = match request {
-                    TargetRequest::Pty { term, col_width, row_height, pix_width, pix_height, modes } => target_write.request_pty(true, &term, col_width, row_height, pix_width, pix_height, &modes).await,
-                    TargetRequest::Shell => target_write.request_shell(true).await,
-                    TargetRequest::Exec(command) => target_write.exec(true, command).await,
-                    TargetRequest::Env { name, value } => target_write.set_env(true, name, value).await,
-                    TargetRequest::Subsystem(name) => target_write.request_subsystem(true, name).await,
-                    TargetRequest::WindowChange { col_width, row_height, pix_width, pix_height } => target_write.window_change(col_width, row_height, pix_width, pix_height).await,
-                    TargetRequest::Signal(signal) => target_write.signal(signal).await,
-                    TargetRequest::Eof => target_write.eof().await,
-                    TargetRequest::Close => target_write.close().await,
+                let TargetRequest { kind, reply } = request;
+                let result = match kind {
+                    TargetRequestKind::Pty { term, col_width, row_height, pix_width, pix_height, modes } => target_write.request_pty(true, &term, col_width, row_height, pix_width, pix_height, &modes).await,
+                    TargetRequestKind::Shell => target_write.request_shell(true).await,
+                    TargetRequestKind::Exec(command) => target_write.exec(true, command).await,
+                    TargetRequestKind::Env { name, value } => target_write.set_env(true, name, value).await,
+                    TargetRequestKind::Subsystem(name) => target_write.request_subsystem(true, name).await,
+                    TargetRequestKind::WindowChange { col_width, row_height, pix_width, pix_height } => target_write.window_change(col_width, row_height, pix_width, pix_height).await,
+                    TargetRequestKind::Signal(signal) => target_write.signal(signal).await,
+                    TargetRequestKind::Eof => target_write.eof().await,
+                    TargetRequestKind::Close => target_write.close().await,
                 };
+                let success = result.is_ok();
+                let _ = reply.send(success);
                 if result.is_err() {
                     break;
                 }
             }
-            message = client_read.wait(), if client_open => {
+            message = client_read.wait() => {
                 match message {
                     Some(ChannelMsg::Data { data }) => {
                         if target_write.data_bytes(data).await.is_err() { break; }
@@ -1764,7 +2102,6 @@ async fn relay_session(
                     }
                     Some(ChannelMsg::Eof) => {
                         let _ = target_write.eof().await;
-                        client_open = false;
                     }
                     Some(ChannelMsg::Close) | None => {
                         let _ = target_write.close().await;
@@ -1773,7 +2110,7 @@ async fn relay_session(
                     _ => {}
                 }
             }
-            message = target_read.wait(), if target_open => {
+            message = target_read.wait() => {
                 match message {
                     Some(ChannelMsg::Data { data }) => {
                         if client_write.data_bytes(data).await.is_err() { break; }
@@ -1786,7 +2123,6 @@ async fn relay_session(
                     }
                     Some(ChannelMsg::Eof) => {
                         let _ = client_write.eof().await;
-                        target_open = false;
                     }
                     Some(ChannelMsg::Close) | None => {
                         let _ = client_write.close().await;
@@ -1839,6 +2175,7 @@ fn local_source_candidates(preferred_interface: Option<u32>) -> Vec<LocalSource>
                 LocalSource {
                     ip,
                     interface_index: interface.index,
+                    interface_name: interface.name,
                 },
             ))
         })
@@ -1886,13 +2223,75 @@ fn force_socket_interface(
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn force_socket_interface(
+    socket: &TcpSocket,
+    source: LocalSource,
+    _remote: IpAddr,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let mut device = source.interface_name.into_bytes();
+    device.push(0);
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            device.as_ptr().cast(),
+            device.len() as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "绑定 Linux 网卡 {} 失败：{}",
+            source.interface_name,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn force_socket_interface(
+    socket: &TcpSocket,
+    source: LocalSource,
+    remote: IpAddr,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let index = source
+        .interface_index
+        .ok_or_else(|| "macOS 网卡缺少接口索引".to_string())?;
+    let (level, option) = match remote {
+        IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_BOUND_IF),
+        IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF),
+    };
+    let value = index as libc::c_uint;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            level,
+            option,
+            (&value as *const libc::c_uint).cast(),
+            std::mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "绑定 macOS 网卡 {} 失败：{}",
+            source.interface_name,
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 fn force_socket_interface(
     _socket: &TcpSocket,
     _source: LocalSource,
     _remote: IpAddr,
 ) -> Result<(), String> {
-    Ok(())
+    Err("当前平台不支持严格的物理网卡绑定".to_string())
 }
 
 async fn connect_target(
@@ -1908,7 +2307,7 @@ async fn connect_target(
         return Err("目标地址没有可用的 IP".to_string());
     }
     let config = Arc::new(client::Config {
-        inactivity_timeout: Some(std::time::Duration::from_secs(30)),
+        inactivity_timeout: None,
         ..Default::default()
     });
     let sources = local_source_candidates(preferred_interface);
@@ -1931,21 +2330,24 @@ async fn connect_target(
             socket
                 .bind(SocketAddr::new(source.ip, 0))
                 .map_err(|error| format!("绑定本地网卡 {} 失败：{error}", source.ip))?;
-            if force_socket_interface(&socket, *source, remote.ip()).is_err() {
+            if force_socket_interface(&socket, source.clone(), remote.ip()).is_err() {
                 continue;
             }
-            match tokio::time::timeout(Duration::from_secs(8), socket.connect(*remote)).await {
-                Ok(Ok(stream)) => match tokio::time::timeout(
+            if let Ok(Ok(stream)) =
+                tokio::time::timeout(Duration::from_secs(8), socket.connect(*remote)).await
+            {
+                if let Ok(Ok(session)) = tokio::time::timeout(
                     Duration::from_secs(8),
                     client::connect_stream(config.clone(), stream, handler.clone()),
                 )
                 .await
                 {
-                    Ok(Ok(session)) => return Ok(session),
-                    Ok(Err(_)) | Err(_) => {}
-                },
-                Ok(Err(_)) | Err(_) => {}
+                    return Ok(session);
+                }
             }
+        }
+        if preferred_interface.is_some() {
+            continue;
         }
         attempts += 1;
         match tokio::time::timeout(Duration::from_secs(8), TcpStream::connect(*remote)).await {
@@ -2013,7 +2415,7 @@ fn spawn_relay(
         let config = russh::server::Config {
             auth_rejection_time: std::time::Duration::from_millis(250),
             auth_rejection_time_initial: Some(std::time::Duration::from_millis(0)),
-            inactivity_timeout: Some(std::time::Duration::from_secs(15 * 60)),
+            inactivity_timeout: None,
             keys: vec![russh::keys::PrivateKey::random(
                 &mut rand::rng(),
                 russh::keys::Algorithm::Ed25519,
@@ -2033,4 +2435,215 @@ fn spawn_relay(
             log_message(format!("ATimeSsh relay stopped: {error}"));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uri_component_is_percent_encoded() {
+        assert_eq!(encode_uri_component("alice@example"), "alice%40example");
+        assert_eq!(encode_uri_component("safe-user_1"), "safe-user_1");
+    }
+
+    #[test]
+    fn ssh_usernames_are_restricted_to_shell_safe_characters() {
+        assert!(valid_ssh_username("deploy_user-1"));
+        assert!(!valid_ssh_username("alice@example"));
+        assert!(!valid_ssh_username("deploy user"));
+        assert!(!valid_ssh_username(""));
+    }
+
+    #[test]
+    fn login_throttle_blocks_then_resets() {
+        let state = AppState {
+            app_port: 1,
+            leases: Arc::new(Mutex::new(HashMap::new())),
+            servers: Arc::new(Mutex::new(HashMap::new())),
+            db: Arc::new(Mutex::new(
+                Connection::open_in_memory().expect("open test db"),
+            )),
+            auth_sessions: Arc::new(Mutex::new(HashMap::new())),
+            encryption_key: Arc::new(Mutex::new(None)),
+            login_throttle: Arc::new(Mutex::new(LoginThrottle::default())),
+        };
+        assert!(login_retry_after(&state).is_none());
+        record_login_failure(&state);
+        assert!(login_retry_after(&state).is_some());
+        reset_login_throttle(&state);
+        assert!(login_retry_after(&state).is_none());
+    }
+
+    #[test]
+    fn credentials_round_trip_with_authenticated_encryption() {
+        let key = [7_u8; 32];
+        let (ciphertext, nonce) = encrypt_secret(&key, "secret-value").expect("encrypt");
+        assert_eq!(
+            decrypt_secret(&key, &ciphertext, &nonce).expect("decrypt"),
+            "secret-value"
+        );
+        assert!(decrypt_secret(&[8_u8; 32], &ciphertext, &nonce).is_err());
+    }
+
+    #[derive(Clone)]
+    struct FakeTarget;
+
+    impl russh::server::Server for FakeTarget {
+        type Handler = Self;
+
+        fn new_client(&mut self, _peer_addr: Option<SocketAddr>) -> Self::Handler {
+            self.clone()
+        }
+    }
+
+    impl russh::server::Handler for FakeTarget {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            _user: &str,
+            _password: &str,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: Channel<Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: ChannelId,
+            _command: &[u8],
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            session.data(channel, b"stdout".to_vec())?;
+            session.extended_data(channel, 1, b"stderr".to_vec())?;
+            session.eof(channel)?;
+            session.exit_status_request(channel, 23)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct AcceptAnyKey;
+
+    impl client::Handler for AcceptAnyKey {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_exit_status_after_target_eof() {
+        let target_listener = TcpListener::bind((DEFAULT_HOST, 0))
+            .await
+            .expect("target listener");
+        let target_addr = target_listener.local_addr().expect("target address");
+        let target_config = Arc::new(russh::server::Config {
+            inactivity_timeout: None,
+            keys: vec![russh::keys::PrivateKey::random(
+                &mut rand::rng(),
+                russh::keys::Algorithm::Ed25519,
+            )
+            .expect("target key")],
+            ..Default::default()
+        });
+        let target_task = tokio::spawn(async move {
+            let (stream, _) = target_listener.accept().await.expect("target connection");
+            russh::server::run_stream(target_config, stream, FakeTarget)
+                .await
+                .expect("target server");
+        });
+
+        let relay_listener = TcpListener::bind((DEFAULT_HOST, 0))
+            .await
+            .expect("relay listener");
+        let relay_addr = relay_listener.local_addr().expect("relay address");
+        let target = ServerConfig {
+            name: "fake".to_string(),
+            host: DEFAULT_HOST.to_string(),
+            port: target_addr.port(),
+            username: "target-user".to_string(),
+            password: "target-password".to_string(),
+            host_key: None,
+        };
+        let relay_task = spawn_relay(relay_listener, "relay-token".to_string(), target, None);
+        let client_config = Arc::new(client::Config {
+            inactivity_timeout: None,
+            ..Default::default()
+        });
+        let mut client = client::connect(client_config, relay_addr, AcceptAnyKey)
+            .await
+            .expect("relay connection");
+        assert!(client
+            .authenticate_password("target-user", "relay-token")
+            .await
+            .expect("relay auth")
+            .success());
+        let mut channel = client.channel_open_session().await.expect("relay channel");
+        channel.exec(true, "test").await.expect("exec request");
+
+        let mut saw_eof = false;
+        let mut saw_exit_status = false;
+        let mut saw_close = false;
+        while let Some(message) = tokio::time::timeout(Duration::from_secs(5), channel.wait())
+            .await
+            .expect("relay response timeout")
+        {
+            match message {
+                ChannelMsg::Eof => saw_eof = true,
+                ChannelMsg::ExitStatus { exit_status } => {
+                    assert_eq!(exit_status, 23);
+                    assert!(saw_eof, "exit-status was lost or reordered before EOF");
+                    saw_exit_status = true;
+                }
+                ChannelMsg::Close => {
+                    saw_close = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_eof);
+        assert!(saw_exit_status);
+        assert!(saw_close);
+        let _ = client
+            .disconnect(russh::Disconnect::ByApplication, "test complete", "en")
+            .await;
+        relay_task.abort();
+        target_task.abort();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_permissions_are_applied() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("atimesh-permissions-{}", Uuid::new_v4()));
+        fs::create_dir(&path).expect("create test directory");
+        harden_path(&path, 0o700).expect("harden test directory");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("stat test directory")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        fs::remove_dir(&path).expect("remove test directory");
+    }
 }

@@ -58,13 +58,6 @@ type NetworkInterface = {
   selectable: boolean
 }
 
-const initialNodes: ServerNode[] = [
-  { id: 'tokyo-api', name: 'TOKYO_API', host: '203.0.113.12', port: 22, environment: 'PRODUCTION', status: 'healthy', latency: 42, lastSeen: '2 min ago', hostKey: null },
-  { id: 'singapore-worker', name: 'SINGAPORE_WORKER', host: '203.0.113.28', port: 22, environment: 'PRODUCTION', status: 'healthy', latency: 58, lastSeen: '4 min ago', hostKey: null },
-  { id: 'staging-box', name: 'STAGING_BOX', host: '198.51.100.24', port: 2222, environment: 'STAGING', status: 'degraded', latency: 92, lastSeen: '18 min ago', hostKey: null },
-  { id: 'local-dev', name: 'LOCAL_DEV', host: '127.0.0.1', port: 22, environment: 'DEVELOPMENT', status: 'offline', latency: null, lastSeen: 'yesterday', hostKey: null },
-]
-
 function formatTime(seconds: number) {
   const safeSeconds = Math.max(0, seconds)
   const minutes = Math.floor(safeSeconds / 60).toString().padStart(2, '0')
@@ -154,14 +147,15 @@ async function renewSessionFromHost(session: Session): Promise<Session> {
   return { ...session, expiresAt: payload.expires_at * 1000, maxExpiresAt: payload.max_expires_at * 1000 }
 }
 
-function revokeSessionOnHost(session: Session | null) {
-  if (!session || session.sessionId.startsWith('mock-')) return
-  void fetch(`/api/ssh-sessions/${encodeURIComponent(session.sessionId)}`, { method: 'POST' })
+async function revokeSessionOnHost(session: Session | null): Promise<boolean> {
+  if (!session) return true
+  const response = await fetch(`/api/ssh-sessions/${encodeURIComponent(session.sessionId)}`, { method: 'POST' })
+  return response.ok
 }
 
 function App() {
-  const [nodes, setNodes] = useState(initialNodes)
-  const [selectedId, setSelectedId] = useState(initialNodes[0].id)
+  const [nodes, setNodes] = useState<ServerNode[]>([])
+  const [selectedId, setSelectedId] = useState('')
   const [appPort] = useState(() => window.location.port || '0')
   const [query, setQuery] = useState('')
   const [sessions, setSessions] = useState<Record<string, Session>>({})
@@ -176,6 +170,7 @@ function App() {
   const [authPassword, setAuthPassword] = useState('')
   const [authConfirm, setAuthConfirm] = useState('')
   const [authNotice, setAuthNotice] = useState('')
+  const [backendError, setBackendError] = useState(false)
   const [language, setLanguage] = useState<Language>(getInitialLanguage)
   const [theme, setTheme] = useState<'dark' | 'light'>(() => window.localStorage.getItem('atimesh-theme') === 'light' ? 'light' : 'dark')
   const [view, setView] = useState<'dashboard' | 'settings'>('dashboard')
@@ -223,10 +218,19 @@ function App() {
   }, [theme])
 
   useEffect(() => {
-    void fetch('/api/auth/status')
-      .then((response) => response.json() as Promise<{ configured: boolean; authenticated: boolean }>)
-      .then(setAuth)
-      .catch(() => setAuth({ configured: false, authenticated: true }))
+    void fetch('/api/auth/status', { cache: 'no-store' })
+      .then((response) => {
+        if (!response.ok) throw new Error(`auth status failed: ${response.status}`)
+        return response.json() as Promise<{ configured: boolean; authenticated: boolean }>
+      })
+      .then((status) => {
+        setBackendError(false)
+        setAuth(status)
+      })
+      .catch(() => {
+        setBackendError(true)
+        setAuth(null)
+      })
   }, [])
 
   useEffect(() => {
@@ -249,14 +253,22 @@ function App() {
           setSessions(restored)
         })
       })
-      .catch(() => undefined)
+      .catch(() => {
+        setNodes([])
+        setSelectedId('')
+        setSessions({})
+        setNotice(t('serverListFailed'))
+      })
     setNetworkLoading(true)
     void Promise.all([fetchNetworkInterfaces(), fetchNetworkSettings()])
       .then(([interfaces, preference]) => {
         setNetworkInterfaces(interfaces)
         setNetworkSelection(preference === null ? 'auto' : String(preference))
       })
-      .catch(() => setNetworkInterfaces([]))
+      .catch(() => {
+        setNetworkInterfaces([])
+        setNotice(t('networkSettingsFailed'))
+      })
       .finally(() => setNetworkLoading(false))
   }, [auth?.authenticated])
 
@@ -289,11 +301,14 @@ function App() {
 
   async function lockConsole() {
     await fetch('/api/auth/logout', { method: 'POST' }).catch(() => undefined)
+    setSessions({})
+    setNodes([])
+    setSelectedId('')
     setAuth((current) => current ? { ...current, authenticated: false } : current)
   }
 
   if (!auth) {
-    return <div className="auth-shell"><div className="auth-card"><div className="brand-mark"><TerminalSquare size={19} /></div><h1>ATimeSsh</h1><p>Loading secure console…</p></div></div>
+    return <div className="auth-shell"><div className="auth-card"><div className="brand-mark"><TerminalSquare size={19} /></div><h1>ATimeSsh</h1><p>{backendError ? t('backendUnavailable') : t('loading')}</p></div></div>
   }
 
   if (!auth.authenticated) {
@@ -316,7 +331,7 @@ function App() {
 
   async function generateSession() {
     if (!hasSelectedNode) return
-    revokeSessionOnHost(session)
+    void revokeSessionOnHost(session)
     try {
       const nextSession = await createSessionFromHost(selectedNode.id)
       setSessions((current) => ({ ...current, [selectedNode.id]: nextSession }))
@@ -330,9 +345,7 @@ function App() {
     if (!session) return
     let nextSession = session
     try {
-      nextSession = session.sessionId.startsWith('mock-')
-        ? { ...session, expiresAt: Math.min(session.expiresAt + 10 * 60 * 1000, session.maxExpiresAt) }
-        : await renewSessionFromHost(session)
+      nextSession = await renewSessionFromHost(session)
     } catch {
       setNotice(t('sessionExpired'))
       return
@@ -497,12 +510,12 @@ function App() {
               <div className="command-row"><div className="command-copy"><code>{session.link}</code><small>SSH COMMAND / {session.command}</small><small>PASSWORD / {session.token}</small></div><button className="copy-button" onClick={copyCommand}>{copied ? <Check size={16} /> : <Copy size={16} />}<span>{copied ? 'COPIED' : 'COPY'}</span></button></div>
               <div className="ttl-row"><div><span className="eyebrow">{t('timeToLive')}</span><div className="countdown">{formatTime(remainingSeconds)}</div></div><div className="ttl-caption">{t('expiresAt')} {new Date(session.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}<br /><span>{t('renewalCapped')}</span></div></div>
               <div className="progress-track"><div className="progress-value" style={{ width: `${progress}%` }} /></div>
-              <div className="session-actions"><button className="secondary-button" onClick={copyCommand}><Clipboard size={15} /> {t('copy')}</button><button className="secondary-button" onClick={renewSession}><RefreshCw size={15} /> {t('renew')}</button><button className="danger-button" onClick={() => { revokeSessionOnHost(session); setSessions((current) => { const next = { ...current }; delete next[selectedNode.id]; return next }); setNotice(t('sessionRevoked')) }}><XCircle size={15} /> {t('revoke')}</button></div>
+           <div className="session-actions"><button className="secondary-button" onClick={copyCommand}><Clipboard size={15} /> {t('copy')}</button><button className="secondary-button" onClick={renewSession}><RefreshCw size={15} /> {t('renew')}</button><button className="danger-button" onClick={async () => { try { if (!await revokeSessionOnHost(session)) throw new Error('revoke failed'); setSessions((current) => { const next = { ...current }; delete next[selectedNode.id]; return next }); setNotice(t('sessionRevoked')) } catch { setNotice(t('sessionRevokeFailed')) } }}><XCircle size={15} /> {t('revoke')}</button></div>
             </> : <div className="session-empty"><Clock3 size={23} /><div><strong>{t('noActiveSession')}</strong><span>{t('createSecureChannel')}</span></div><button className="secondary-button" onClick={generateSession}><Plus size={15} /> {t('createSession')}</button></div>}
           </section>
 
           <section className="audit-section"><div className="section-label"><span>{t('auditTrail')}</span><button className="text-button"><RefreshCw size={13} /> {t('refresh')}</button></div><div className="audit-list"><Audit time="14:21:18" text={t('sessionCreated')} /><Audit time="14:21:20" text={t('hostVerified')} /><Audit time="14:22:06" text={t('clipboardRequested')} /></div></section>
-          <footer className="main-footer"><span>ATimeSsh / {t('localInfrastructure')}</span><span>v0.1.0 · {t('secureMode')}</span></footer>
+           <footer className="main-footer"><span>ATimeSsh / {t('localInfrastructure')}</span><span>v0.1.3 · {t('secureMode')}</span></footer>
           </> : <HomeView t={t} onAddNode={() => { setView('dashboard'); setIsAddOpen(true) }} />}
         </main>
       </div>
@@ -565,7 +578,7 @@ function SettingsView({
         </section>
         <div className="settings-actions"><span>{t('settingsApplyHint')}</span><button className="primary-button" type="submit" disabled={saving || loading}><Check size={15} /> {saving ? t('saving') : t('saveNetworkSettings')}</button></div>
       </form>
-      <footer className="main-footer"><span>ATimeSsh / {t('localInfrastructure')}</span><span>v0.1.0 · {t('secureMode')}</span></footer>
+      <footer className="main-footer"><span>ATimeSsh / {t('localInfrastructure')}</span><span>v0.1.3 · {t('secureMode')}</span></footer>
     </div>
   )
 }
@@ -604,7 +617,7 @@ function HomeView({ t, onAddNode }: { t: (key: Parameters<typeof translate>[1]) 
         </div>
       </section>
 
-      <footer className="main-footer"><span>ATimeSsh / {t('localInfrastructure')}</span><span>v0.1.0 · {t('secureMode')}</span></footer>
+      <footer className="main-footer"><span>ATimeSsh / {t('localInfrastructure')}</span><span>v0.1.3 · {t('secureMode')}</span></footer>
     </div>
   )
 }

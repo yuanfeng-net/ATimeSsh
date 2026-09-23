@@ -23,7 +23,7 @@ const zh: Dictionary = {
   inactive: '未启用',
   timeToLive: '剩余时间',
   expiresAt: '到期时间',
-  renewalCapped: '续期上限为 60 分钟',
+  renewalCapped: '续期上限为 48 小时',
   copy: '复制',
   copied: '已复制',
   renew: '续期',
@@ -58,6 +58,7 @@ const zh: Dictionary = {
   sessionRenewed: '临时访问通道已续期 10 分钟',
   sessionMaxRenewed: '已续期至最大允许时间',
   sessionRevoked: '临时访问通道已撤销',
+  sessionRevokeFailed: '临时访问通道撤销失败',
   sessionExpired: '临时访问通道已自动关闭',
   commandCopied: '完整临时 SSH 链接已复制到剪贴板',
   noMatchingNodes: '没有匹配的节点',
@@ -117,6 +118,8 @@ const zh: Dictionary = {
   nodeUpdateFailed: '服务器更新失败',
   nodeSaveFailed: '服务器保存失败，请检查地址、端口和 SSH 服务',
   hostKeyChangedOnSave: '主机指纹发生变化，服务器未保存',
+  backendUnavailable: '本地服务不可用，请重新启动 ATimeSsh',
+  serverListFailed: '服务器列表读取失败',
 }
 
 const en: Dictionary = {
@@ -140,7 +143,7 @@ const en: Dictionary = {
   inactive: 'INACTIVE',
   timeToLive: 'TIME TO LIVE',
   expiresAt: 'Expires at',
-  renewalCapped: 'renewal window is capped at 60 min',
+  renewalCapped: 'renewal window is capped at 48 hours',
   copy: 'COPY',
   copied: 'COPIED',
   renew: 'RENEW',
@@ -175,6 +178,7 @@ const en: Dictionary = {
   sessionRenewed: 'Temporary access channel renewed for 10 minutes',
   sessionMaxRenewed: 'Renewed to the maximum allowed time',
   sessionRevoked: 'Temporary access channel revoked',
+  sessionRevokeFailed: 'Temporary access channel could not be revoked',
   sessionExpired: 'Temporary access channel expired and closed',
   commandCopied: 'Complete temporary SSH link copied to clipboard',
   noMatchingNodes: 'NO MATCHING NODES',
@@ -234,6 +238,8 @@ const en: Dictionary = {
   nodeUpdateFailed: 'Server could not be updated',
   nodeSaveFailed: 'Server could not be saved. Check the address, port, and SSH service.',
   hostKeyChangedOnSave: 'Host fingerprint changed. Server was not saved.',
+  backendUnavailable: 'The local service is unavailable. Restart ATimeSsh.',
+  serverListFailed: 'The server list could not be loaded',
 }
 
 const dictionaries: Record<Language, Dictionary> = { zh, en }

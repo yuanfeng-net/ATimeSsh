@@ -129,7 +129,7 @@ install -Dm644 packaging/linux/atimesh.desktop "$HOME/.local/share/applications/
 - **手动选择**：从枚举到的物理接口中指定一个网卡。
 - 选择会保存到 SQLite 的 `app_config` 表。
 - 设置只影响后续主机指纹扫描和新建 Relay，不会强制中断已有会话。
-- Windows 连接会使用接口索引设置 `IP_UNICAST_IF` / `IPV6_UNICAST_IF`；指定接口不可用时仍保留默认路由回退。
+- Windows、Linux 和 macOS 会在手动选择时绑定指定物理网卡；指定接口不可用时连接失败，不会静默回退到默认路由。
 
 ## 数据与安全
 
@@ -137,11 +137,13 @@ install -Dm644 packaging/linux/atimesh.desktop "$HOME/.local/share/applications/
 
 | 平台 | 默认目录 |
 | --- | --- |
-| Windows | `%LOCALAPPDATA%\ATimeSsh`（部分环境使用 `%APPDATA%`） |
+| Windows | `%USERPROFILE%\ATimeSsh`（例如 `C:\Users\用户名\ATimeSsh`） |
 | macOS | `~/Library/Application Support/ATimeSsh` |
 | Linux | `$XDG_DATA_HOME/ATimeSsh`，未设置时为 `~/.local/share/ATimeSsh` |
 
 运行日志文件为上述目录中的 `atimesh.log`。桌面启动不会创建额外命令行窗口。
+
+Windows 版本首次启动时会自动将旧 `%LOCALAPPDATA%\ATimeSsh` 数据迁移到 `%USERPROFILE%\ATimeSsh`；后续更新或重装程序不会删除该目录。
 
 主要文件是 `atimesh.sqlite3`。数据库包含服务器配置、加密密码、主机指纹、应用设置和临时会话元数据。
 

@@ -130,7 +130,7 @@ Open “Settings” at the bottom of the left sidebar:
 - **Manual selection**: choose one of the detected physical adapters.
 - The preference is stored in SQLite in the `app_config` table.
 - The preference applies only to future host-key scans and new Relays; active sessions are not forcibly interrupted.
-- On Windows, connections use `IP_UNICAST_IF` / `IPV6_UNICAST_IF` with the selected interface index. A default-route fallback remains available if the selected adapter is unavailable.
+- On Windows, Linux, and macOS, manual selection binds connections to the selected physical adapter. If it is unavailable, the connection fails instead of silently falling back to the default route.
 
 ## Data and Security
 
@@ -138,13 +138,15 @@ Application data is stored under the platform user-data directory:
 
 | Platform | Default directory |
 | --- | --- |
-| Windows | `%LOCALAPPDATA%\ATimeSsh` (some environments use `%APPDATA%`) |
+| Windows | `%USERPROFILE%\ATimeSsh` (for example `C:\Users\username\ATimeSsh`) |
 | macOS | `~/Library/Application Support/ATimeSsh` |
 | Linux | `$XDG_DATA_HOME/ATimeSsh`, or `~/.local/share/ATimeSsh` when unset |
 
 The main file is `atimesh.sqlite3`. It contains server configuration, encrypted passwords, host fingerprints, application settings, and temporary-session metadata.
 
 The runtime log is `atimesh.log` in the same directory. Desktop launches do not create an additional command-line window.
+
+On Windows, the first launch automatically migrates data from the legacy `%LOCALAPPDATA%\ATimeSsh` directory to `%USERPROFILE%\ATimeSsh`; subsequent updates or reinstalls do not remove this directory.
 
 - Security password: Argon2 hash; plaintext is never stored.
 - Server password: encrypted with AES-256-GCM using a key derived from the security password.
