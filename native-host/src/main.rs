@@ -538,6 +538,14 @@ fn valid_ssh_username(username: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+fn relay_credentials_match(user: &str, password: &str, target_username: &str, token: &str) -> bool {
+    (user == target_username && password == token)
+        || user
+            .strip_prefix(target_username)
+            .and_then(|value| value.strip_prefix(':'))
+            .is_some_and(|embedded_token| embedded_token == token)
+}
+
 fn encode_uri_component(value: &str) -> String {
     value.bytes().fold(String::new(), |mut encoded, byte| {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -1825,7 +1833,7 @@ impl server::Handler for RelayHandler {
     }
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
-        if user == self.target.username && password == self.token {
+        if relay_credentials_match(user, password, &self.target.username, &self.token) {
             Ok(Auth::Accept)
         } else {
             Ok(Auth::reject())
@@ -2453,6 +2461,34 @@ mod tests {
         assert!(!valid_ssh_username("alice@example"));
         assert!(!valid_ssh_username("deploy user"));
         assert!(!valid_ssh_username(""));
+    }
+
+    #[test]
+    fn relay_accepts_standard_and_uri_userinfo_credentials() {
+        assert!(relay_credentials_match(
+            "root",
+            "relay-token",
+            "root",
+            "relay-token"
+        ));
+        assert!(relay_credentials_match(
+            "root:relay-token",
+            "",
+            "root",
+            "relay-token"
+        ));
+        assert!(!relay_credentials_match(
+            "root:wrong-token",
+            "",
+            "root",
+            "relay-token"
+        ));
+        assert!(!relay_credentials_match(
+            "root-other:relay-token",
+            "",
+            "root",
+            "relay-token"
+        ));
     }
 
     #[test]
