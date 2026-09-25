@@ -540,10 +540,13 @@ fn valid_ssh_username(username: &str) -> bool {
 
 fn relay_credentials_match(user: &str, password: &str, target_username: &str, token: &str) -> bool {
     (user == target_username && password == token)
-        || user
-            .strip_prefix(target_username)
-            .and_then(|value| value.strip_prefix(':'))
-            .is_some_and(|embedded_token| embedded_token == token)
+        || relay_uri_credentials_match(user, target_username, token)
+}
+
+fn relay_uri_credentials_match(user: &str, target_username: &str, token: &str) -> bool {
+    user.strip_prefix(target_username)
+        .and_then(|value| value.strip_prefix(':'))
+        .is_some_and(|embedded_token| embedded_token == token)
 }
 
 fn encode_uri_component(value: &str) -> String {
@@ -1816,6 +1819,14 @@ impl client::Handler for TargetClient {
 impl server::Handler for RelayHandler {
     type Error = russh::Error;
 
+    async fn auth_none(&mut self, user: &str) -> Result<Auth, Self::Error> {
+        if relay_uri_credentials_match(user, &self.target.username, &self.token) {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::reject())
+        }
+    }
+
     async fn shell_request(
         &mut self,
         channel: ChannelId,
@@ -2489,6 +2500,7 @@ mod tests {
             "root",
             "relay-token"
         ));
+        assert!(!relay_uri_credentials_match("root", "root", "relay-token"));
     }
 
     #[test]
@@ -2627,9 +2639,9 @@ mod tests {
             .await
             .expect("relay connection");
         assert!(client
-            .authenticate_password("target-user", "relay-token")
+            .authenticate_none("target-user:relay-token")
             .await
-            .expect("relay auth")
+            .expect("relay URI auth")
             .success());
         let mut channel = client.channel_open_session().await.expect("relay channel");
         channel.exec(true, "test").await.expect("exec request");
